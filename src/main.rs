@@ -1,9 +1,14 @@
+mod gocardless;
+
 use std::env;
 
 use anyhow::{Context, Result};
 
 use serde::{Deserialize, Serialize};
 
+use gocardless::GoCardlessClient;
+
+// STRUCTS
 #[derive(Serialize)]
 struct TokenRequest {
     secret_id: String,
@@ -18,6 +23,28 @@ struct TokenResponse {
     refresh_expires: i64,
 }
 
+// // HELPERS
+// async fn authenticate(secret_id: String, secret_key: String) -> Result<TokenResponse> {
+//     let client = reqwest::Client::new();
+//
+//     let body = TokenRequest {
+//         secret_id,
+//         secret_key,
+//     };
+//
+//     let response = client
+//         .post("https://bankaccountdata.gocardless.com/api/v2/token/new/")
+//         .json(&body)
+//         .send()
+//         .await?
+//         .error_for_status()?
+//         .json::<TokenResponse>()
+//         .await?;
+//
+//     Ok(response)
+// }
+
+// MAIN
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -27,8 +54,10 @@ async fn main() -> Result<()> {
     let secret_key =
         env::var("GOCARDLESS_SECRET_KEY").context("GOCARDLESS_SECRET_KEY is not set")?;
 
-    println!("Secret ID loaded: {}", secret_id);
-    println!("Secret key length: {}", secret_key.len());
+    let (_client, token) = GoCardlessClient::authenticate(&secret_id, &secret_key).await?;
+
+    println!("Authenticated successfully");
+    println!("Access token expires in {} seconds", token.access_expires);
 
     Ok(())
 }
