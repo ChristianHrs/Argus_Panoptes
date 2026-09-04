@@ -23,6 +23,7 @@ target
 
 # environment
 .env
+keys/
 
 
 # SQLite
