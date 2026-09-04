@@ -7,8 +7,8 @@ edition = "2024"
 anyhow = "1.0.104"
 chrono = "0.4.45"
 dotenvy = "0.15.7"
-jsonwebtoken = "11.0.0"
-reqwest = { version = "0.13.4", features = ["json"] }
+jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
+reqwest = { version = "0.13.4", features = ["json", "query"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["full"] }

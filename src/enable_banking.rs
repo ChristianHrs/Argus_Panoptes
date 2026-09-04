@@ -53,3 +53,51 @@ pub fn create_jwt(
 
     Ok(token)
 }
+
+
+use serde::Deserialize;
+
+const BASE_URL: &str =
+    "https://api.enablebanking.com";
+
+#[derive(Debug, Deserialize)]
+pub struct AspspResponse {
+    pub aspsps: Vec<Aspsp>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Aspsp {
+    pub name: String,
+    pub country: String,
+
+    #[serde(default)]
+    pub services: Vec<String>,
+
+    #[serde(rename = "psuTypes", default)]
+    pub psu_types: Vec<String>,
+}
+
+pub async fn get_banks(
+    jwt: &str,
+) -> Result<AspspResponse> {
+    let client =
+        reqwest::Client::new();
+
+    let response = client
+        .get(format!(
+            "{BASE_URL}/aspsps"
+        ))
+        .query(&[
+            ("country", "GB"),
+            ("psu_type", "personal"),
+            ("service", "AIS"),
+        ])
+        .bearer_auth(jwt)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<AspspResponse>()
+        .await?;
+
+    Ok(response)
+}
