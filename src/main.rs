@@ -1,69 +1,111 @@
 mod enable_banking;
 
-use uuid::Uuid;
-
 use std::env;
 
-use anyhow::{Context, Ok, Result};
-
+use anyhow::{Context, Result};
+use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ------------------------------------------------------------
+    // 1. Load configuration
+    // ------------------------------------------------------------
     dotenvy::dotenv().ok();
 
-    let app_id = env::var("ENABLE_BANKING_APP_ID").context("ENABLE_BANKING_APP_ID is not set")?;
+    let app_id = env::var("ENABLE_BANKING_APP_ID")
+        .context("ENABLE_BANKING_APP_ID is not set")?;
 
-    let private_key_path =
-        env::var("ENABLE_BANKING_PRIVATE_KEY").context("ENABLE_BANKING_PRIVATE_KEY is not set")?;
+    let private_key_path = env::var("ENABLE_BANKING_PRIVATE_KEY")
+        .context("ENABLE_BANKING_PRIVATE_KEY is not set")?;
 
-    let redirect =
-        env::var("REDIRECT_URL").context("REDIRECT_URL is not set")?;
+    let redirect_url = env::var("REDIRECT_URL")
+        .context("REDIRECT_URL is not set")?;
 
-    let jwt = enable_banking::create_jwt(&app_id, &private_key_path,)?;
+    // ------------------------------------------------------------
+    // 2. Generate JWT used to authenticate with Enable Banking
+    // ------------------------------------------------------------
+    let jwt = enable_banking::create_jwt(
+        &app_id,
+        &private_key_path,
+    )?;
 
     println!("JWT generated successfully");
-    println!("JWT length :{}", jwt.len());
+    println!("JWT length: {}", jwt.len());
 
-    enable_banking::get_application(&jwt).await?;
+    // ------------------------------------------------------------
+    // 3. Fetch ASPSPs available to this sandbox application
+    // ------------------------------------------------------------
 
-    let banks = enable_banking::get_banks(&jwt).await?;
-    println!("Found {} ASPSPs", banks.aspsps.len());
-    for bank in banks.aspsps {
-        println!(
-            "{} ({}) | {:?} | max consent: {} seconds",
-            bank.name,
-            bank.country,
-            bank.psu_types,
-            bank.maximum_consent_validity,
+    let banks = enable_banking::get_banks(&jwt)
+        .await?;
+
+    println!(
+        "Found {} available ASPSPs",
+        banks.aspsps.len()
+    );
+
+    // ------------------------------------------------------------
+    // 4. Find the French Mock ASPSP
+    // ------------------------------------------------------------
+    //
+    // Sandbox application does not currently have GB enabled,
+    // but it does have FR enabled.
+    let mock_bank = banks
+        .aspsps
+        .iter()
+        .find(|bank| {
+            bank.name == "Mock ASPSP"
+                && bank.country == "FR"
+        })
+        .context(
+            "Mock ASPSP for FR was not found in available ASPSPs"
+        )?;
+
+    println!();
+    println!("Using sandbox ASPSP:");
+    println!("  Name: {}", mock_bank.name);
+    println!("  Country: {}", mock_bank.country);
+    println!("  PSU types: {:?}", mock_bank.psu_types);
+    println!(
+        "  Maximum consent validity: {} seconds",
+        mock_bank.maximum_consent_validity
+    );
+
+    // ------------------------------------------------------------
+    // 5. Generate state for the authorization request
+    // ------------------------------------------------------------
+    let state = Uuid::new_v4().to_string();
+
+    println!();
+    println!("Authorization state: {state}");
+
+    // ------------------------------------------------------------
+    // 6. Start Open Banking authorization
+    // ------------------------------------------------------------
+    let authorization =
+        enable_banking::start_authorization(
+            &jwt,
+            &mock_bank.name,
+            &mock_bank.country,
+            &redirect_url,
+            &state,
         )
-    }
+        .await?;
+
+    // ------------------------------------------------------------
+    // 7. Print authorization information
+    // ------------------------------------------------------------
+    println!();
+    println!("Authorization started successfully");
+
+    println!(
+        "Authorization ID: {}",
+        authorization.authorization_id
+    );
+
+    println!();
+    println!("Open this URL in your browser:");
+    println!("{}", authorization.url);
+
     Ok(())
-
-
-    // let state = Uuid::new_v4().to_string();
-
-    // let authorization = enable_banking::start_authorization(
-    //     &jwt, "Mock ASPSP", "GB", &redirect, &state
-    // ).await?;
-    // println!("Authorization started");
-    // println!("Authorization ID: {}", authorization.authorization_id);
-    // println!("State {state}");
-    // println!();
-
-    // println!("Open:");
-    // println!("{}", authorization.url);
-
-
-    // let banks = enable_banking::get_banks(&jwt).await?;
-    // for bank in banks.aspsps {
-    //     println!(
-    //         "{} ({}) | {:?} | max consent: {} seconds",
-    //         bank.name,
-    //         bank.country,
-    //         bank.psu_types,
-    //         bank.maximum_consent_validity,
-    //     )
-    // }
-
-    // Ok(())
 }

@@ -93,20 +93,20 @@ pub async fn get_banks(
         // ])
         .bearer_auth(jwt)
         .send()
+        .await?
+        .error_for_status()?
+        .json::<AspspResponse>()
         .await?;
-        // .error_for_status()?
-        // .json::<AspspResponse>()
-        // .await?;
 
-    let status = response.status();
-    let body = response.text().await?;
+    // let status = response.status();
+    // let body = response.text().await?;
 
-    println!("GET /aspsps status: {status}");
-    println!("GET /aspsps body:");
-    println!("{body}");
+    // println!("GET /aspsps status: {status}");
+    // println!("GET /aspsps body:");
+    // println!("{body}");
 
-    let response =
-        serde_json::from_str::<AspspResponse>(&body)?;
+    // let response =
+    //     serde_json::from_str::<AspspResponse>(&body)?;
 
     Ok(response)
 }
