@@ -1,5 +1,6 @@
 use std::fs;
 
+use anyhow::Ok;
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use jsonwebtoken::{
@@ -215,4 +216,67 @@ pub async fn get_application(
     println!("{body}");
 
     Ok(serde_json::from_str(&body)?)
+}
+
+
+#[derive(Debug, Serialize)]
+struct AuthorizeSessionRequest<'a> {
+    code: &'a str,
+}
+
+pub async fn authorize_session (
+    jwt: &str, code: &str
+) -> Result<serde_json::Value> {
+    let client = reqwest::Client::new();
+    let body = AuthorizeSessionRequest {
+        code,
+    };
+
+    let response = client
+        .post(format!("{BASE_URL}/sessions"))
+        .bearer_auth(jwt)
+        .json(&body)
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+
+    if !status.is_success() {
+        anyhow::bail!(
+            "Enable Banking returned {status}: {body}"
+        );
+    }
+
+    let session = serde_json::from_str::<serde_json::Value>(&body)?;
+
+    Ok(session)
+}
+
+pub async fn get_transactions(
+    jwt: &str,
+    account_uid: &str,
+) -> Result<serde_json::Value> {
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!(
+            "{BASE_URL}/accounts/{account_uid}/transactions"
+        ))
+        .bearer_auth(jwt)
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+
+    if !status.is_success() {
+        anyhow::bail!(
+            "Enable Banking returned {status}: {body}"
+        );
+    }
+
+    let transactions = serde_json::from_str::<serde_json::Value>(&body)?;
+
+    Ok(transactions)
 }
