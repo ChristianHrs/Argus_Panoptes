@@ -280,3 +280,29 @@ pub async fn get_transactions(
 
     Ok(transactions)
 }
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SessionResponse {
+    pub session_id: String,
+
+    #[serde(default)]
+    pub accounts: Vec<Account>,
+    pub aspsp: SessionAspsp,
+    pub status: Option<String>,
+    pub access: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SessionAspsp {
+    pub name: String,
+    pub country: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Account {
+    pub uid: String,
+    pub name: Option<String>,
+
+    #[serde(default)]
+    pub cash_account_type: Option<String>,
+}

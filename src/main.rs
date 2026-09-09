@@ -1,4 +1,5 @@
 mod callback;
+mod db;
 mod enable_banking;
 
 use std::env;
@@ -143,5 +144,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
-// code: 8e1e742a-d483-4836-beb0-1f4ed812da85
