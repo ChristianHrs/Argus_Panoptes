@@ -1,15 +1,111 @@
 use std::fs;
+use std::time::Duration;
 
-use anyhow::Ok;
-use anyhow::Result;
-use chrono::{Duration, Utc};
-use jsonwebtoken::{
-    encode,
-    Algorithm,
-    EncodingKey,
-    Header,
-};
-use serde::Serialize;
+use anyhow::{Context, Result};
+use chrono::{DateTime, NaiveDate, Utc};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const BASE_URL: &str = "https://api.enablebanking.com";
+
+/// The API rejects tokens with a TTL over 86400s. An hour is plenty.
+const JWT_TTL_SECS: i64 = 3600;
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiErrorKind {
+    /// Session died, possibly before valid_until. Requires re-authorisation.
+    ExpiredSession,
+    /// ASPSP_RATE_LIMIT_EXCEEDED. Background fetching is often capped at 4/day.
+    RateLimited,
+    /// The requested date range is not available from this ASPSP.
+    WrongTransactionsPeriod,
+    /// Transient ASPSP-side failure; retry with backoff.
+    AspspError,
+    Other,
+}
+
+#[derive(Debug)]
+pub struct ApiError {
+    pub status: u16,
+    pub code: String,
+    pub message: String,
+    pub kind: ApiErrorKind,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Enable Banking {} {}: {}", self.status, self.code, self.message)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+impl ApiError {
+    fn classify(code: &str, body: &str) -> ApiErrorKind {
+        let haystack = format!("{code} {body}").to_uppercase();
+
+        if haystack.contains("EXPIRED_SESSION") {
+            ApiErrorKind::ExpiredSession
+        } else if haystack.contains("RATE_LIMIT") {
+            ApiErrorKind::RateLimited
+        } else if haystack.contains("WRONG_TRANSACTIONS_PERIOD") {
+            ApiErrorKind::WrongTransactionsPeriod
+        } else if haystack.contains("ASPSP_ERROR") {
+            ApiErrorKind::AspspError
+        } else {
+            ApiErrorKind::Other
+        }
+    }
+
+    /// The exact error envelope isn't guaranteed, so probe the likely shapes
+    /// and fall back to substring matching on the raw body.
+    fn from_response(status: u16, body: &str) -> Self {
+        let parsed: Option<Value> = serde_json::from_str(body).ok();
+
+        let code = parsed
+            .as_ref()
+            .and_then(|v| {
+                v.pointer("/error/code")
+                    .or_else(|| v.get("error_code"))
+                    .or_else(|| v.get("code"))
+                    .or_else(|| v.get("error").filter(|e| e.is_string()))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("UNKNOWN")
+            .to_string();
+
+        let message = parsed
+            .as_ref()
+            .and_then(|v| {
+                v.pointer("/error/message")
+                    .or_else(|| v.get("message"))
+                    .or_else(|| v.get("detail"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or(body)
+            .chars()
+            .take(500)
+            .collect::<String>();
+
+        let kind = Self::classify(&code, body);
+
+        ApiError { status, code, message, kind }
+    }
+}
+
+/// Convenience for callers: `if let Some(e) = api_error(&err) { ... }`
+pub fn api_error(error: &anyhow::Error) -> Option<&ApiError> {
+    error.downcast_ref::<ApiError>()
+}
+
+// ---------------------------------------------------------------------------
+// JWT
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize)]
 struct Claims {
@@ -19,12 +115,9 @@ struct Claims {
     exp: i64,
 }
 
-pub fn create_jwt(
-    app_id: &str,
-    private_key_path: &str,
-) -> Result<String> {
-    let private_key =
-        fs::read(private_key_path)?;
+pub fn create_jwt(app_id: &str, private_key_path: &str) -> Result<String> {
+    let private_key = fs::read(private_key_path)
+        .with_context(|| format!("cannot read private key at {private_key_path}"))?;
 
     let now = Utc::now().timestamp();
 
@@ -32,34 +125,21 @@ pub fn create_jwt(
         iss: "enablebanking.com".to_string(),
         aud: "api.enablebanking.com".to_string(),
         iat: now,
-        exp: now + 3600,
+        exp: now + JWT_TTL_SECS,
     };
 
-    let mut header =
-        Header::new(Algorithm::RS256);
-
+    let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(app_id.to_string());
 
-    let key =
-        EncodingKey::from_rsa_pem(
-            &private_key
-        )?;
+    let key = EncodingKey::from_rsa_pem(&private_key)
+        .context("private key is not a valid RSA PEM")?;
 
-    let token =
-        encode(
-            &header,
-            &claims,
-            &key,
-        )?;
-
-    Ok(token)
+    Ok(encode(&header, &claims, &key)?)
 }
 
-
-use serde::Deserialize;
-
-const BASE_URL: &str =
-    "https://api.enablebanking.com";
+// ---------------------------------------------------------------------------
+// Data types
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 pub struct AspspResponse {
@@ -74,235 +154,262 @@ pub struct Aspsp {
     #[serde(default)]
     pub psu_types: Vec<String>,
 
-    pub maximum_consent_validity: i64,
+    /// Seconds. Usually 15552000 (180 days). Optional because sandbox ASPSPs
+    /// don't always report it.
+    #[serde(default)]
+    pub maximum_consent_validity: Option<i64>,
+
+    #[serde(default)]
+    pub beta: bool,
 }
 
-pub async fn get_banks(
-    jwt: &str,
-) -> Result<AspspResponse> {
-    let client =
-        reqwest::Client::new();
+impl Aspsp {
+    /// Longest consent this bank will grant, capped at its own maximum, with a
+    /// small safety margin so a boundary value isn't rejected.
+    pub fn max_valid_until(&self) -> DateTime<Utc> {
+        let seconds = self
+            .maximum_consent_validity
+            .unwrap_or(90 * 24 * 3600)
+            .max(3600)
+            - 60;
 
-    let response = client
-        .get(format!(
-            "{BASE_URL}/aspsps"
-        ))
-        // .query(&[
-        //     ("country", "GB"),
-        //     ("psu_type", "personal"),
-        //     ("service", "AIS"),
-        // ])
-        .bearer_auth(jwt)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<AspspResponse>()
-        .await?;
-
-    // let status = response.status();
-    // let body = response.text().await?;
-
-    // println!("GET /aspsps status: {status}");
-    // println!("GET /aspsps body:");
-    // println!("{body}");
-
-    // let response =
-    //     serde_json::from_str::<AspspResponse>(&body)?;
-
-    Ok(response)
-}
-
-
-#[derive(Debug, Serialize)]
-struct AccessRequest {
-    balances: bool,
-    transactions: bool,
-    valid_until: String,
-}
-
-#[derive(Debug, Serialize)]
-struct AspspRequest<'a> {
-    name: &'a str,
-    country: &'a str,
-}
-
-#[derive(Debug, Serialize)]
-struct StartAuthorizationRequest<'a> {
-    access: AccessRequest,
-    aspsp: AspspRequest<'a>,
-    state: &'a str,
-    redirect_url: &'a str,
-    psu_type: &'a str,
+        Utc::now() + chrono::Duration::seconds(seconds)
+    }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct StartAuthorizationResponse {
     pub url: String,
     pub authorization_id: String,
-    pub psu_id_hash: String,
+
+    #[serde(default)]
+    pub psu_id_hash: Option<String>,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct TransactionQuery {
+    pub date_from: Option<NaiveDate>,
+    pub date_to: Option<NaiveDate>,
+    /// "default" for incremental syncs, "longest" for the initial backfill.
+    pub strategy: Option<&'static str>,
+}
 
-pub async fn start_authorization(
-    jwt: &str,
-    bank_name: &str,
-    country: &str,
-    redirect_url: &str,
-    state: &str
-) -> Result<StartAuthorizationResponse> {
-    let client = reqwest::Client::new();
+#[derive(Debug)]
+pub struct TransactionPage {
+    pub transactions: Vec<Value>,
+    pub continuation_key: Option<String>,
+}
 
-    let valid_until = (
-        (Utc::now() + Duration::days(1))
-    ).to_rfc3339();
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
 
-    let body = StartAuthorizationRequest {
-        access: AccessRequest {
-            balances: true,
-            transactions: true,
-            valid_until,
-        },
+pub struct Client {
+    http: reqwest::Client,
+    jwt: String,
+}
 
-        aspsp: AspspRequest {
-            name: bank_name, country
-        },
+impl Client {
+    pub fn new(jwt: String) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()?;
 
-        state,
-        redirect_url,
-        psu_type: "personal"
-    };
+        Ok(Self { http, jwt })
+    }
 
-    let response = client
-        .post(format!("{BASE_URL}/auth"))
-        .bearer_auth(jwt)
-        .json(&body)
-        .send()
-        .await?;
+    async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
+        let response = self
+            .http
+            .get(format!("{BASE_URL}{path}"))
+            .query(query)
+            .bearer_auth(&self.jwt)
+            .send()
+            .await?;
 
-    let status = response.status();
+        Self::read(response).await
+    }
 
-    if !status.is_success() {
+    async fn post<B: Serialize>(&self, path: &str, body: &B) -> Result<Value> {
+        let response = self
+            .http
+            .post(format!("{BASE_URL}{path}"))
+            .bearer_auth(&self.jwt)
+            .json(body)
+            .send()
+            .await?;
+
+        Self::read(response).await
+    }
+
+    async fn read(response: reqwest::Response) -> Result<Value> {
+        let status = response.status();
         let body = response.text().await?;
 
-        anyhow::bail!(
-            "Enable Banking returned {status}: {body}"
-        );
+        if !status.is_success() {
+            return Err(ApiError::from_response(status.as_u16(), &body).into());
+        }
+
+        serde_json::from_str(&body)
+            .with_context(|| format!("unparseable success body: {}", truncate(&body, 300)))
     }
 
-    let authorization = response
-        .json::<StartAuthorizationResponse>()
-        .await?;
+    // -- endpoints ----------------------------------------------------------
 
-    Ok(authorization)
-}
+    pub async fn aspsps(&self, country: Option<&str>) -> Result<Vec<Aspsp>> {
+        let mut query = vec![];
+        if let Some(country) = country {
+            query.push(("country", country.to_uppercase()));
+        }
 
-// Debug purpose
-pub async fn get_application(
-    jwt: &str,
-) -> Result<serde_json::Value> {
-    let client = reqwest::Client::new();
-
-    let response = client
-        .get(format!("{BASE_URL}/application"))
-        .bearer_auth(jwt)
-        .send()
-        .await?;
-
-    let status = response.status();
-    let body = response.text().await?;
-
-    println!("GET /application status: {status}");
-    println!("GET /application body:");
-    println!("{body}");
-
-    Ok(serde_json::from_str(&body)?)
-}
-
-
-#[derive(Debug, Serialize)]
-struct AuthorizeSessionRequest<'a> {
-    code: &'a str,
-}
-
-pub async fn authorize_session (
-    jwt: &str, code: &str
-) -> Result<serde_json::Value> {
-    let client = reqwest::Client::new();
-    let body = AuthorizeSessionRequest {
-        code,
-    };
-
-    let response = client
-        .post(format!("{BASE_URL}/sessions"))
-        .bearer_auth(jwt)
-        .json(&body)
-        .send()
-        .await?;
-
-    let status = response.status();
-    let body = response.text().await?;
-
-    if !status.is_success() {
-        anyhow::bail!(
-            "Enable Banking returned {status}: {body}"
-        );
+        let value = self.get("/aspsps", &query).await?;
+        Ok(serde_json::from_value::<AspspResponse>(value)?.aspsps)
     }
 
-    let session = serde_json::from_str::<serde_json::Value>(&body)?;
+    pub async fn start_authorization(
+        &self,
+        aspsp: &Aspsp,
+        redirect_url: &str,
+        state: &str,
+        valid_until: DateTime<Utc>,
+        psu_type: &str,
+    ) -> Result<StartAuthorizationResponse> {
+        let body = serde_json::json!({
+            "access": {
+                "balances": true,
+                "transactions": true,
+                "valid_until": valid_until.to_rfc3339(),
+            },
+            "aspsp": { "name": aspsp.name, "country": aspsp.country },
+            "state": state,
+            "redirect_url": redirect_url,
+            "psu_type": psu_type,
+        });
 
-    Ok(session)
-}
-
-pub async fn get_transactions(
-    jwt: &str,
-    account_uid: &str,
-) -> Result<serde_json::Value> {
-    let client = reqwest::Client::new();
-
-    let response = client
-        .get(format!(
-            "{BASE_URL}/accounts/{account_uid}/transactions"
-        ))
-        .bearer_auth(jwt)
-        .send()
-        .await?;
-
-    let status = response.status();
-    let body = response.text().await?;
-
-    if !status.is_success() {
-        anyhow::bail!(
-            "Enable Banking returned {status}: {body}"
-        );
+        let value = self.post("/auth", &body).await?;
+        Ok(serde_json::from_value(value)?)
     }
 
-    let transactions = serde_json::from_str::<serde_json::Value>(&body)?;
+    /// POST /sessions. Returns the raw Value because a chunk of this payload is
+    /// only ever shown once and is worth persisting verbatim.
+    pub async fn authorize_session(&self, code: &str) -> Result<Value> {
+        self.post("/sessions", &serde_json::json!({ "code": code }))
+            .await
+    }
 
-    Ok(transactions)
+    pub async fn session(&self, session_id: &str) -> Result<Value> {
+        self.get(&format!("/sessions/{session_id}"), &[]).await
+    }
+
+    pub async fn balances(&self, account_uid: &str) -> Result<Vec<Value>> {
+        let value = self
+            .get(&format!("/accounts/{account_uid}/balances"), &[])
+            .await?;
+
+        Ok(value
+            .get("balances")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// One page of transactions.
+    ///
+    /// When continuing, every other query parameter must be identical to the
+    /// first request, so the query is rebuilt from the same `TransactionQuery`
+    /// each time rather than mutated.
+    pub async fn transactions_page(
+        &self,
+        account_uid: &str,
+        query: &TransactionQuery,
+        continuation_key: Option<&str>,
+    ) -> Result<TransactionPage> {
+        let mut params: Vec<(&str, String)> = vec![];
+
+        if let Some(date_from) = query.date_from {
+            params.push(("date_from", date_from.to_string()));
+        }
+        if let Some(date_to) = query.date_to {
+            params.push(("date_to", date_to.to_string()));
+        }
+        if let Some(strategy) = query.strategy {
+            params.push(("strategy", strategy.to_string()));
+        }
+        if let Some(key) = continuation_key {
+            params.push(("continuation_key", key.to_string()));
+        }
+
+        let value = self
+            .get(&format!("/accounts/{account_uid}/transactions"), &params)
+            .await?;
+
+        Ok(TransactionPage {
+            transactions: value
+                .get("transactions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            continuation_key: value
+                .get("continuation_key")
+                .and_then(Value::as_str)
+                .filter(|k| !k.is_empty())
+                .map(str::to_string),
+        })
+    }
+
+    /// Drain every page.
+    ///
+    /// Two behaviours that look like bugs but aren't: an empty transaction list
+    /// can arrive *with* a continuation key (keep going), and page size varies
+    /// by ASPSP and by account. Mock ASPSP returns 10 at a time.
+    ///
+    /// `on_page` is called per page so the caller can persist incrementally
+    /// rather than buffering an entire multi-year history in memory.
+    pub async fn transactions_all<F>(
+        &self,
+        account_uid: &str,
+        query: &TransactionQuery,
+        max_pages: usize,
+        mut on_page: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(Vec<Value>) -> Result<()>,
+    {
+        let mut continuation_key: Option<String> = None;
+        let mut pages = 0usize;
+
+        loop {
+            let page = self
+                .transactions_page(account_uid, query, continuation_key.as_deref())
+                .await?;
+
+            pages += 1;
+            let has_more = page.continuation_key.is_some();
+
+            on_page(page.transactions)?;
+
+            continuation_key = page.continuation_key;
+
+            if !has_more {
+                break;
+            }
+
+            if pages >= max_pages {
+                eprintln!(
+                    "  stopping at {max_pages} pages for {account_uid}; \
+                     a continuation key was still pending"
+                );
+                break;
+            }
+
+            // Be polite to the ASPSP; some are aggressive about burst limits.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+
+        Ok(pages)
+    }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct SessionResponse {
-    pub session_id: String,
-
-    #[serde(default)]
-    pub accounts: Vec<Account>,
-    pub aspsp: SessionAspsp,
-    pub status: Option<String>,
-    pub access: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct SessionAspsp {
-    pub name: String,
-    pub country: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Account {
-    pub uid: String,
-    pub name: Option<String>,
-
-    #[serde(default)]
-    pub cash_account_type: Option<String>,
+fn truncate(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
 }
