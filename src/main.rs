@@ -32,7 +32,7 @@ impl Config {
             redirect_url: env::var("REDIRECT_URL").context("REDIRECT_URL is not set")?,
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://spending.db".to_string()),
-            default_country: env::var("COUNTRY").unwrap_or_else(|_| "GB".to_string()),
+            default_country: env::var("COUNTRY").unwrap_or_else(|_| "FR".to_string()),
             default_bank: env::var("BANK_NAME").unwrap_or_else(|_| "Mock ASPSP".to_string()),
             psu_type: env::var("PSU_TYPE").unwrap_or_else(|_| "personal".to_string()),
         })
