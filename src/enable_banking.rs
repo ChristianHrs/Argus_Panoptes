@@ -12,6 +12,12 @@ pub const BASE_URL: &str = "https://api.enablebanking.com";
 /// The API rejects tokens with a TTL over 86400s. An hour is plenty.
 const JWT_TTL_SECS: i64 = 3600;
 
+/// Backdate `iat` slightly. A local clock a few seconds ahead of Enable
+/// Banking's makes the token look issued in the future, which is rejected with
+/// a 401 "JWT can not be issued in the future". Standard practice for any JWT
+/// issuer; does not weaken anything, since `exp` still bounds the lifetime.
+const JWT_SKEW_SECS: i64 = 60;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -26,6 +32,9 @@ pub enum ApiErrorKind {
     WrongTransactionsPeriod,
     /// Transient ASPSP-side failure; retry with backoff.
     AspspError,
+    /// 401/403 — bad JWT, wrong app ID, key mismatch, or clock skew. Retrying
+    /// is pointless; the operator has to fix something.
+    Unauthorized,
     Other,
 }
 
@@ -46,10 +55,12 @@ impl std::fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 impl ApiError {
-    fn classify(code: &str, body: &str) -> ApiErrorKind {
+    fn classify(status: u16, code: &str, body: &str) -> ApiErrorKind {
         let haystack = format!("{code} {body}").to_uppercase();
 
-        if haystack.contains("EXPIRED_SESSION") {
+        if status == 401 || status == 403 {
+            ApiErrorKind::Unauthorized
+        } else if haystack.contains("EXPIRED_SESSION") {
             ApiErrorKind::ExpiredSession
         } else if haystack.contains("RATE_LIMIT") {
             ApiErrorKind::RateLimited
@@ -92,7 +103,7 @@ impl ApiError {
             .take(500)
             .collect::<String>();
 
-        let kind = Self::classify(&code, body);
+        let kind = Self::classify(status, &code, body);
 
         ApiError { status, code, message, kind }
     }
@@ -124,7 +135,7 @@ pub fn create_jwt(app_id: &str, private_key_path: &str) -> Result<String> {
     let claims = Claims {
         iss: "enablebanking.com".to_string(),
         aud: "api.enablebanking.com".to_string(),
-        iat: now,
+        iat: now - JWT_SKEW_SECS,
         exp: now + JWT_TTL_SECS,
     };
 
@@ -203,6 +214,14 @@ pub struct TransactionPage {
 // ---------------------------------------------------------------------------
 // Client
 // ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct PageRun {
+    pub pages: usize,
+    /// True when the page cap was hit while a continuation key was still
+    /// pending, i.e. the history is incomplete.
+    pub truncated: bool,
+}
 
 pub struct Client {
     http: reqwest::Client,
@@ -371,7 +390,7 @@ impl Client {
         query: &TransactionQuery,
         max_pages: usize,
         mut on_page: F,
-    ) -> Result<usize>
+    ) -> Result<PageRun>
     where
         F: FnMut(Vec<Value>) -> Result<()>,
     {
@@ -395,18 +414,14 @@ impl Client {
             }
 
             if pages >= max_pages {
-                eprintln!(
-                    "  stopping at {max_pages} pages for {account_uid}; \
-                     a continuation key was still pending"
-                );
-                break;
+                return Ok(PageRun { pages, truncated: true });
             }
 
             // Be polite to the ASPSP; some are aggressive about burst limits.
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
 
-        Ok(pages)
+        Ok(PageRun { pages, truncated: false })
     }
 }
 

@@ -22,6 +22,35 @@ pub struct SyncOutcome {
     pub fetched: usize,
     pub booked: u64,
     pub pending: u64,
+    /// Booking dates actually returned, so silent truncation by the ASPSP is
+    /// visible rather than invisible.
+    pub earliest: Option<String>,
+    pub latest: Option<String>,
+    /// Page cap reached with more data still pending.
+    pub truncated: bool,
+}
+
+impl SyncOutcome {
+    pub fn summary(&self) -> String {
+        let range = match (&self.earliest, &self.latest) {
+            (Some(from), Some(to)) => format!("  {from} to {to}"),
+            _ => String::new(),
+        };
+
+        format!(
+            "{} page(s), {} transactions ({} booked, {} pending){}{}",
+            self.pages,
+            self.fetched,
+            self.booked,
+            self.pending,
+            range,
+            if self.truncated {
+                "  [TRUNCATED — page cap hit, history incomplete]"
+            } else {
+                ""
+            }
+        )
+    }
 }
 
 pub async fn sync_all(pool: &SqlitePool, api: &Client) -> Result<()> {
@@ -36,10 +65,7 @@ pub async fn sync_all(pool: &SqlitePool, api: &Client) -> Result<()> {
         println!("\n=== {label}");
 
         match sync_account(pool, api, account_id, &uid).await {
-            Ok(outcome) => println!(
-                "  {} pages, {} transactions ({} booked, {} pending)",
-                outcome.pages, outcome.fetched, outcome.booked, outcome.pending
-            ),
+            Ok(outcome) => println!("  {}", outcome.summary()),
             Err(error) => eprintln!("  failed: {error:#}"),
         }
     }
@@ -122,6 +148,11 @@ pub async fn sync_account(
                     store::back_off(pool, account_id, 1).await?;
                     ("ASPSP_ERROR", "bank-side error, retry later")
                 }
+                Some(ApiErrorKind::Unauthorized) => (
+                    "UNAUTHORIZED",
+                    "authentication rejected — check the app ID, the private key, \
+                     and your system clock",
+                ),
                 _ => ("ERROR", "unhandled error"),
             };
 
@@ -206,8 +237,14 @@ async fn fetch_and_store(
             .await;
 
         match pages {
-            Ok(pages) => {
+            Ok(run) => {
                 let fetched = collected.len();
+
+                let mut dates: Vec<&str> = collected
+                    .iter()
+                    .filter_map(|t| t.get("booking_date").and_then(Value::as_str))
+                    .collect();
+                dates.sort_unstable();
 
                 let booked = store::upsert_booked(pool, account_id, &collected).await?;
 
@@ -216,10 +253,13 @@ async fn fetch_and_store(
                 let pending = store::replace_pending(pool, account_id, &collected).await?;
 
                 return Ok(SyncOutcome {
-                    pages,
+                    pages: run.pages,
+                    truncated: run.truncated,
                     fetched,
                     booked: booked.inserted,
                     pending,
+                    earliest: dates.first().map(|d| d.to_string()),
+                    latest: dates.last().map(|d| d.to_string()),
                 });
             }
 

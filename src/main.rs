@@ -32,7 +32,7 @@ impl Config {
             redirect_url: env::var("REDIRECT_URL").context("REDIRECT_URL is not set")?,
             database_url: env::var("DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://spending.db".to_string()),
-            default_country: env::var("COUNTRY").unwrap_or_else(|_| "FR".to_string()),
+            default_country: env::var("COUNTRY").unwrap_or_else(|_| "GB".to_string()),
             default_bank: env::var("BANK_NAME").unwrap_or_else(|_| "Mock ASPSP".to_string()),
             psu_type: env::var("PSU_TYPE").unwrap_or_else(|_| "personal".to_string()),
         })
@@ -44,7 +44,16 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let config = Config::from_env()?;
-    let args: Vec<String> = env::args().skip(1).collect();
+
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+
+    // Flags are stripped before positional parsing so `connect --manual` and
+    // `connect "Lloyds Bank" GB --manual` both work.
+    let manual = raw_args.iter().any(|a| a == "--manual");
+    let args: Vec<String> = raw_args
+        .into_iter()
+        .filter(|a| !a.starts_with("--"))
+        .collect();
 
     let pool = {
         ensure_parent_dir(&config.database_url)?;
@@ -63,7 +72,7 @@ async fn main() -> Result<()> {
         Some("connect") => {
             let bank = args.get(1).cloned().unwrap_or(config.default_bank.clone());
             let country = args.get(2).cloned().unwrap_or(config.default_country.clone());
-            connect(&pool, &api, &config, &bank, &country).await
+            connect(&pool, &api, &config, &bank, &country, manual).await
         }
 
         Some("sync") => sync::sync_all(&pool, &api).await,
@@ -74,7 +83,9 @@ async fn main() -> Result<()> {
             println!(
                 "usage:\n  \
                  banks [country]              list ASPSPs\n  \
-                 connect [bank] [country]     authorise a bank and backfill history\n  \
+                 connect [bank] [country]     authorise a bank and backfill history\n    \
+                 --manual                   paste the redirect URL instead of \
+                 running a local callback server\n  \
                  sync                         incremental transaction sync\n  \
                  accounts                     show stored accounts"
             );
@@ -93,6 +104,7 @@ async fn connect(
     config: &Config,
     bank_name: &str,
     country: &str,
+    manual: bool,
 ) -> Result<()> {
     // Always resolve the bank fresh. There is no stable ASPSP identifier and
     // names change on rebrand, so a hardcoded name eventually 404s.
@@ -130,9 +142,15 @@ async fn connect(
     )
     .await?;
 
-    // Server first: the bank can redirect before start_authorization returns.
-    let port = callback_port(&config.redirect_url)?;
-    let callback_receiver = callback::start_callback_server(port).await?;
+    // In manual mode there is nothing to listen on: production applications
+    // reject http redirect URLs, so the bank sends the code to a public https
+    // address and it gets pasted back in here.
+    let callback_receiver = if manual {
+        None
+    } else {
+        let port = callback_port(&config.redirect_url)?;
+        Some(callback::start_callback_server(port).await?)
+    };
 
     let state = Uuid::new_v4().to_string();
 
@@ -160,15 +178,21 @@ async fn connect(
 
     println!("Authorization {}", authorization.authorization_id);
 
-    if webbrowser::open(&authorization.url).is_err() {
-        println!("Open this URL manually:\n  {}", authorization.url);
-    }
+    let callback = match callback_receiver {
+        Some(receiver) => {
+            if webbrowser::open(&authorization.url).is_err() {
+                println!("Open this URL manually:\n  {}", authorization.url);
+            }
 
-    println!("Waiting for the bank to redirect back...");
+            println!("Waiting for the bank to redirect back...");
 
-    let callback = callback_receiver
-        .await
-        .context("callback server stopped unexpectedly")?;
+            receiver
+                .await
+                .context("callback server stopped unexpectedly")?
+        }
+
+        None => read_callback_from_stdin(&authorization.url).await?,
+    };
 
     if let Some(error) = callback.error {
         let description = callback.error_description.unwrap_or_default();
@@ -176,15 +200,26 @@ async fn connect(
         bail!("bank authorization failed: {error}: {description}");
     }
 
-    let returned_state = callback.state.context("callback did not contain state")?;
+    // A pasted bare code carries no state. The CSRF risk the state parameter
+    // defends against does not apply when a human moved the value by hand, so
+    // it is validated when present and skipped when not.
+    match callback.state.as_deref() {
+        Some(returned_state) => {
+            // Checked against the database rather than a local variable, so
+            // this still works if the callback arrives after a restart.
+            let matched = store::find_pending_authorization(pool, returned_state).await?;
 
-    // Validated against the database rather than a local variable, so this
-    // still works if the callback arrives after a restart.
-    let matched = store::find_pending_authorization(pool, &returned_state).await?;
-
-    if matched != Some(authorization_row_id) {
-        store::fail_authorization(pool, authorization_row_id, "state_mismatch", None).await?;
-        bail!("authorization state mismatch — possible CSRF, refusing to continue");
+            if matched != Some(authorization_row_id) {
+                store::fail_authorization(pool, authorization_row_id, "state_mismatch", None)
+                    .await?;
+                bail!("authorization state mismatch — possible CSRF, refusing to continue");
+            }
+        }
+        None if manual => println!("No state in the pasted value; skipping the CSRF check."),
+        None => {
+            store::fail_authorization(pool, authorization_row_id, "missing_state", None).await?;
+            bail!("callback did not contain state");
+        }
     }
 
     let code = callback.code.context("callback did not contain code")?;
@@ -257,13 +292,21 @@ async fn list_banks(api: &Client, country: &str) -> Result<()> {
 }
 
 async fn list_accounts(pool: &sqlx::SqlitePool) -> Result<()> {
-    let rows = sqlx::query_as::<_, (String, String, Option<String>, i64, Option<String>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (String, String, Option<String>, i64, Option<String>, Option<String>, Option<String>),
+    >(
         r#"
         SELECT p.name,
                COALESCE(a.display_name, a.name, a.identification_hash),
                a.currency,
                (SELECT COUNT(*) FROM transactions t WHERE t.account_id = a.id),
-               st.last_success_at
+               st.last_success_at,
+               (SELECT MAX(s.valid_until)
+                  FROM sessions s
+                  JOIN session_accounts sa ON sa.session_id = s.id
+                 WHERE sa.account_id = a.id AND s.status = 'AUTHORIZED'),
+               (SELECT MIN(t.booking_date) FROM transactions t WHERE t.account_id = a.id)
           FROM accounts a
           JOIN aspsps p ON p.id = a.aspsp_id
      LEFT JOIN account_sync_state st ON st.account_id = a.id
@@ -278,15 +321,46 @@ async fn list_accounts(pool: &sqlx::SqlitePool) -> Result<()> {
         return Ok(());
     }
 
-    for (bank, name, currency, count, last_sync) in rows {
+    let today = chrono::Utc::now().date_naive();
+
+    for (bank, name, currency, count, last_sync, valid_until, earliest) in rows {
         println!(
-            "  {:<20} {:<30} {:<4} {:>6} txns   last sync {}",
+            "  {:<20} {:<28} {:<4} {:>6} txns since {}",
             bank,
             name,
             currency.unwrap_or_default(),
             count,
+            earliest.unwrap_or_else(|| "-".to_string())
+        );
+
+        println!(
+            "  {:<20} last sync {}",
+            "",
             last_sync.unwrap_or_else(|| "never".to_string())
         );
+
+        // Consent expiry is silent when it arrives: the sync just stops
+        // returning new data. Surface the countdown.
+        match valid_until.as_deref() {
+            Some(raw) => {
+                let days = raw
+                    .get(..10)
+                    .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+                    .map(|d| (d - today).num_days());
+
+                let note = match days {
+                    Some(d) if d < 0 => "  EXPIRED — run `connect` again".to_string(),
+                    Some(d) if d <= 14 => format!("  {d} days left — renew soon"),
+                    Some(d) => format!("  {d} days left"),
+                    None => String::new(),
+                };
+
+                println!("  {:<20} consent until {}{}", "", &raw[..10.min(raw.len())], note);
+            }
+            None => println!("  {:<20} consent expiry not reported by this ASPSP", ""),
+        }
+
+        println!();
     }
 
     Ok(())
@@ -295,6 +369,94 @@ async fn list_accounts(pool: &sqlx::SqlitePool) -> Result<()> {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+/// Manual paste flow. Accepts either the whole redirected URL or a bare code.
+async fn read_callback_from_stdin(auth_url: &str) -> Result<callback::AuthCallback> {
+    println!("\nOpen this URL and authorise:\n\n  {auth_url}\n");
+    println!(
+        "The bank will redirect to a page that may not load — that is fine. \
+         Copy the full URL from the address bar and paste it here\n\
+         (a bare code works too), then press enter:\n"
+    );
+
+    let line = tokio::task::spawn_blocking(|| {
+        use std::io::BufRead;
+        let mut buffer = String::new();
+        std::io::stdin().lock().read_line(&mut buffer)?;
+        Ok::<_, std::io::Error>(buffer)
+    })
+    .await??;
+
+    let input = line.trim();
+
+    if input.is_empty() {
+        bail!("nothing pasted");
+    }
+
+    // Bare code: no query string to pick apart.
+    if !input.contains('=') {
+        return Ok(callback::AuthCallback {
+            code: Some(input.to_string()),
+            state: None,
+            error: None,
+            error_description: None,
+        });
+    }
+
+    let query = input.split_once('?').map(|(_, q)| q).unwrap_or(input);
+    let params = parse_query(query);
+
+    Ok(callback::AuthCallback {
+        code: params.get("code").cloned(),
+        state: params.get("state").cloned(),
+        error: params.get("error").cloned(),
+        error_description: params.get("error_description").cloned(),
+    })
+}
+
+fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(key, value)| (key.to_string(), percent_decode(value)))
+        .collect()
+}
+
+/// Minimal percent-decoding. Authorization codes are usually URL-safe, but
+/// error_description is prose and will contain encoded spaces.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                match u8::from_str_radix(hex, 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&out).into_owned()
+}
 
 /// create_if_missing creates the database file, not the directory holding it.
 fn ensure_parent_dir(database_url: &str) -> Result<()> {
