@@ -30,3 +30,6 @@ keys/
 *.db
 *.db-shm
 *.db-wal
+
+# Private banking inforamtion
+/statements
