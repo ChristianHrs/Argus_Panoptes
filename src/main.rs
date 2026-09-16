@@ -1,4 +1,5 @@
 mod callback;
+mod csv_import;
 mod db;
 mod enable_banking;
 mod store;
@@ -50,6 +51,7 @@ async fn main() -> Result<()> {
     // Flags are stripped before positional parsing so `connect --manual` and
     // `connect "Lloyds Bank" GB --manual` both work.
     let manual = raw_args.iter().any(|a| a == "--manual");
+    let dry_run = raw_args.iter().any(|a| a == "--dry-run");
     let args: Vec<String> = raw_args
         .into_iter()
         .filter(|a| !a.starts_with("--"))
@@ -77,6 +79,13 @@ async fn main() -> Result<()> {
 
         Some("sync") => sync::sync_all(&pool, &api).await,
 
+        Some("import") => {
+            let file = args
+                .get(1)
+                .context("usage: import <statement.csv> [--dry-run]")?;
+            import(&pool, std::path::Path::new(file), dry_run).await
+        }
+
         Some("accounts") => list_accounts(&pool).await,
 
         _ => {
@@ -87,6 +96,8 @@ async fn main() -> Result<()> {
                  --manual                   paste the redirect URL instead of \
                  running a local callback server\n  \
                  sync                         incremental transaction sync\n  \
+                 import <file.csv>            import a Revolut consolidated statement\n    \
+                 --dry-run                  parse and verify without writing\n  \
                  accounts                     show stored accounts"
             );
             Ok(())
@@ -369,6 +380,52 @@ async fn list_accounts(pool: &sqlx::SqlitePool) -> Result<()> {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+async fn import(pool: &sqlx::SqlitePool, path: &std::path::Path, dry_run: bool) -> Result<()> {
+    if dry_run {
+        println!("Dry run — nothing will be written.\n");
+    }
+
+    let reports = csv_import::import_file(pool, path, dry_run).await?;
+
+    for report in &reports {
+        let period = report
+            .period
+            .map(|(from, to)| format!("{from} to {to}"))
+            .unwrap_or_else(|| "unknown period".to_string());
+
+        println!(
+            "  {:<4} {:>4} rows  {}{}",
+            report.currency,
+            report.parsed,
+            period,
+            if dry_run {
+                String::new()
+            } else {
+                format!("  ({} inserted, {} replaced)", report.inserted, report.deleted)
+            }
+        );
+
+        // A break means the export dropped or reordered rows. Surfaced loudly
+        // because everything downstream silently inherits the gap.
+        if report.chain_breaks.is_empty() {
+            println!("       balance chain verified");
+        } else {
+            println!(
+                "       BALANCE CHAIN BROKEN at {} point(s):",
+                report.chain_breaks.len()
+            );
+            for issue in report.chain_breaks.iter().take(5) {
+                println!("         {issue}");
+            }
+        }
+    }
+
+    let total: usize = reports.iter().map(|r| r.parsed).sum();
+    println!("\n{total} transactions across {} wallet(s)", reports.len());
+
+    Ok(())
+}
 
 /// Manual paste flow. Accepts either the whole redirected URL or a bare code.
 async fn read_callback_from_stdin(auth_url: &str) -> Result<callback::AuthCallback> {
