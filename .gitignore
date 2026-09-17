@@ -32,4 +32,4 @@ keys/
 *.db-wal
 
 # Private banking inforamtion
-/statements
+/bank_statements

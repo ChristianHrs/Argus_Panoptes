@@ -1,360 +1,368 @@
--- Enable Banking -> SQLite ingestion schema.
+-- Personal spending tracker — bank statement ingestion.
+--
+-- Sources are downloaded statements (CSV today, PDF later), not an API.
+-- Nothing here assumes a live connection, consent, or session.
 --
 -- Conventions:
---   * All timestamps are ISO-8601 UTC with milliseconds ("2026-09-10T14:22:01.123Z"),
---     which is both RFC3339-parseable by chrono and lexicographically sortable.
---     Never use DEFAULT CURRENT_TIMESTAMP -- it emits "2026-09-10 14:22:01"
---     (space separator, no zone) and will not round-trip through DateTime<Utc>.
---   * Dates from the API (booking_date, value_date) stay as plain "YYYY-MM-DD".
---   * Money is stored twice: amount_text is the exact decimal string from the API
---     (source of truth, never lossy), amount_minor is a signed integer in the
---     currency's minor unit for fast SQL aggregation. Never REAL.
---   * raw_json keeps the untouched payload so you can re-derive columns later
---     without re-fetching from the bank.
+--   * Timestamps: ISO-8601 UTC with milliseconds, e.g. "2026-09-14T14:22:01.123Z".
+--     Never DEFAULT CURRENT_TIMESTAMP — it emits a space separator and no zone,
+--     and will not round-trip through chrono's DateTime<Utc>.
+--   * Dates from statements stay as plain "YYYY-MM-DD".
+--   * Money is stored twice: amount_text is the exact string from the file
+--     (source of truth, never lossy); amount_minor is a signed integer in the
+--     currency's minor unit for aggregation. Never REAL.
+--   * raw_json keeps the original row so columns can be re-derived later
+--     without re-downloading anything.
 
 
 ------------------------------------------------------------------------------
--- ASPSPs (banks). Identified by name + country + psu_type; there is no stable
--- bank ID in the API, and names change on rebrand, so always re-resolve against
--- GET /aspsps before starting a re-authorisation.
+-- Institutions. One row per bank, not per statement format.
 ------------------------------------------------------------------------------
-CREATE TABLE aspsps (
-    id                        INTEGER PRIMARY KEY,
+CREATE TABLE institutions (
+    id         INTEGER PRIMARY KEY,
 
-    name                      TEXT NOT NULL,
-    country                   TEXT NOT NULL,
-    psu_type                  TEXT NOT NULL DEFAULT 'personal',
+    name       TEXT NOT NULL,          -- 'Revolut', 'Lloyds'
+    country    TEXT NOT NULL DEFAULT 'GB',
 
-    -- From GET /aspsps, in SECONDS. Usually 15552000 (180 days).
-    max_consent_validity_secs INTEGER,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 
-    created_at                TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at                TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-
-    UNIQUE (name, country, psu_type)
+    UNIQUE (name, country)
 );
 
 
 ------------------------------------------------------------------------------
--- In-flight authorisation attempts. Written BEFORE the browser opens, so a
--- crash between POST /auth and the callback is recoverable and the CSRF state
--- survives a process restart.
-------------------------------------------------------------------------------
-CREATE TABLE authorizations (
-    id                    INTEGER PRIMARY KEY,
-    aspsp_id              INTEGER NOT NULL REFERENCES aspsps(id) ON DELETE CASCADE,
-
-    state                 TEXT NOT NULL UNIQUE,   -- our CSRF nonce
-    authorization_id      TEXT NOT NULL,          -- from POST /auth
-    psu_id_hash           TEXT,
-
-    requested_valid_until TEXT NOT NULL,
-
-    status                TEXT NOT NULL DEFAULT 'PENDING'
-                          CHECK (status IN ('PENDING', 'COMPLETED', 'FAILED', 'ABANDONED')),
-    error                 TEXT,
-    error_description     TEXT,
-
-    created_at            TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    completed_at          TEXT
-);
-
-CREATE INDEX ix_authorizations_status ON authorizations(status);
-
-
-------------------------------------------------------------------------------
--- Authorised sessions. One per successful POST /sessions. Old rows are kept
--- (not deleted) so you retain the audit trail of which consent produced which
--- data pull.
-------------------------------------------------------------------------------
-CREATE TABLE sessions (
-    id                  INTEGER PRIMARY KEY,
-    aspsp_id            INTEGER NOT NULL REFERENCES aspsps(id) ON DELETE CASCADE,
-    authorization_id    INTEGER REFERENCES authorizations(id) ON DELETE SET NULL,
-
-    provider_session_id TEXT NOT NULL UNIQUE,     -- session_id from the API
-
-    -- AUTHORIZED / EXPIRED / CLOSED / INVALID. Flip to EXPIRED locally the
-    -- moment a fetch returns the EXPIRED_SESSION error, which can happen well
-    -- before valid_until (bank-side KYC prompts, single-session ASPSPs, etc).
-    status              TEXT NOT NULL,
-
-    valid_until         TEXT,
-    authorized_at       TEXT,
-
-    raw_json            TEXT NOT NULL,
-
-    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-);
-
-CREATE INDEX ix_sessions_aspsp_status ON sessions(aspsp_id, status);
-
-
-------------------------------------------------------------------------------
--- Accounts as STABLE entities, keyed on identification_hash. This row survives
--- re-authorisation; transactions hang off it, so your history is continuous
--- across consent renewals.
+-- Accounts.
+--
+-- Statements carry no stable account identifier, so account_key is synthesised
+-- and must be deterministic: the same real-world account must always produce
+-- the same key or history fragments. Revolut's seven currency wallets all
+-- share one IBAN, so currency is the discriminator there:
+--   'revolut:gb:GBP'      'lloyds:gb:12345678'
 ------------------------------------------------------------------------------
 CREATE TABLE accounts (
-    id                  INTEGER PRIMARY KEY,
-    aspsp_id            INTEGER NOT NULL REFERENCES aspsps(id) ON DELETE CASCADE,
+    id             INTEGER PRIMARY KEY,
+    institution_id INTEGER NOT NULL REFERENCES institutions(id) ON DELETE CASCADE,
 
-    identification_hash TEXT NOT NULL UNIQUE,
+    account_key    TEXT NOT NULL UNIQUE,
 
-    -- 'XXX' is a legitimate value: ASPSPs use it for multi-currency accounts
-    -- (expect it from Revolut). Balances then arrive per-currency instead.
-    currency            TEXT,
+    currency       TEXT NOT NULL,
+    name           TEXT,               -- as the statement labels it
+    display_name   TEXT,               -- your own label; sync never overwrites
+    account_type   TEXT,               -- 'current', 'savings', 'credit_card'
 
-    name                TEXT,        -- bank-supplied
-    display_name        TEXT,        -- your own label, never overwritten by sync
-    product             TEXT,
-    cash_account_type   TEXT,        -- CACC, CARD, SVGS, ...
-    usage               TEXT,        -- PRIV / ORGA
+    -- Last four digits only. Full account numbers and IBANs are not worth
+    -- storing in a file that lives in a git-adjacent directory.
+    identifier_tail TEXT,
 
-    iban                TEXT,
-    masked_pan          TEXT,
-    bban                TEXT,
+    active         INTEGER NOT NULL DEFAULT 1,
 
-    active              INTEGER NOT NULL DEFAULT 1,
-
-    raw_json            TEXT NOT NULL,
-
-    first_seen_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    first_seen_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+CREATE INDEX ix_accounts_institution ON accounts(institution_id);
 
 
 ------------------------------------------------------------------------------
--- The session-scoped handle. `uid` is what goes in
--- GET /accounts/{uid}/transactions and is only valid for its own session.
+-- One row per imported file, per account.
+--
+-- Records the balance-chain verification. Statements can silently omit rows
+-- (Lloyds caps exports at 150 transactions), and a recomputed running balance
+-- that disagrees with the file's own balance column is the only reliable way
+-- to notice.
 ------------------------------------------------------------------------------
-CREATE TABLE session_accounts (
-    session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+CREATE TABLE import_batches (
+    id              INTEGER PRIMARY KEY,
+    account_id      INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
 
-    uid        TEXT NOT NULL UNIQUE,
+    filename        TEXT NOT NULL,
+    source          TEXT NOT NULL,     -- 'revolut_csv', 'lloyds_csv', 'lloyds_pdf'
 
-    raw_json   TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    period_start    TEXT,
+    period_end      TEXT,
 
-    PRIMARY KEY (session_id, account_id)
+    rows_parsed     INTEGER NOT NULL DEFAULT 0,
+    rows_inserted   INTEGER NOT NULL DEFAULT 0,
+    rows_replaced   INTEGER NOT NULL DEFAULT 0,
+
+    chain_verified  INTEGER NOT NULL DEFAULT 0,
+    chain_breaks    INTEGER NOT NULL DEFAULT 0,
+
+    opening_balance TEXT,
+    closing_balance TEXT,
+
+    imported_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
-CREATE INDEX ix_session_accounts_account ON session_accounts(account_id);
+CREATE INDEX ix_import_batches_account ON import_batches(account_id, imported_at DESC);
 
 
 ------------------------------------------------------------------------------
 -- Transactions.
 --
--- Dedupe strategy:
---   BOOK -> unique on (account_id, dedupe_key), enforced by a PARTIAL index so
---           it only applies to booked rows. dedupe_key is entry_reference when
---           the ASPSP supplies one, otherwise a synthetic composite key built
---           in Rust (date|amount|currency|indicator|counterparty|reference plus
---           an occurrence ordinal to survive two identical coffees on one day).
---   PDNG -> NOT deduped. entry_reference is usually absent for pending, and the
---           fields mutate before settlement. Delete all PDNG rows for an
---           account and re-insert the fresh set on every sync.
+-- Import is replace-by-range, not merge: each statement is authoritative for
+-- its period, so the importer deletes that account's rows within the file's
+-- date range and inserts fresh. Merging is unsafe because Revolut emits rows
+-- identical on date, description, amount AND running balance — an intervening
+-- credit can restore the balance between two identical debits.
+--
+-- row_key still exists, and must be STABLE across files of different date
+-- ranges, because manual categories hang off it. So the occurrence ordinal
+-- counts identical tuples within a single day, never position in the file.
+--   revolut_csv:2026-08-09:-14.00:3845:Transfer to SHANA...:1
 ------------------------------------------------------------------------------
 CREATE TABLE transactions (
-    id                    INTEGER PRIMARY KEY,
-    account_id            INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    id                 INTEGER PRIMARY KEY,
+    account_id         INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    batch_id           INTEGER REFERENCES import_batches(id) ON DELETE SET NULL,
 
-    status                TEXT NOT NULL CHECK (status IN ('BOOK', 'PDNG', 'INFO', 'OTHR')),
+    row_key            TEXT NOT NULL,
 
-    entry_reference       TEXT,
-    dedupe_key            TEXT NOT NULL,
+    booking_date       TEXT NOT NULL,          -- YYYY-MM-DD
+    value_date         TEXT,
 
-    booking_date          TEXT,       -- YYYY-MM-DD
-    value_date            TEXT,
-    transaction_date      TEXT,
+    description        TEXT NOT NULL DEFAULT '',
+    -- The bank's own label: Revolut gives 'Merchant', 'Exchange', 'Top up',
+    -- 'ATM', 'Others'. Free first-pass categorisation.
+    source_category    TEXT,
+    reference          TEXT,
 
-    -- Signed: DBIT is stored negative so SUM() is spend-aware without CASE.
-    amount_minor          INTEGER NOT NULL,
-    amount_text           TEXT NOT NULL,
-    currency              TEXT NOT NULL,
-    credit_debit          TEXT NOT NULL CHECK (credit_debit IN ('CRDT', 'DBIT')),
+    -- Signed: money out is negative, so SUM() is spend-aware without CASE.
+    amount_minor       INTEGER NOT NULL,
+    amount_text        TEXT NOT NULL,
+    currency           TEXT NOT NULL,
+    direction          TEXT NOT NULL CHECK (direction IN ('CRDT', 'DBIT')),
 
-    counterparty_name     TEXT,
-    counterparty_account  TEXT,
-    reference             TEXT,       -- flattened remittance_information
+    -- Statement's own converted figure, when the export is set to show a base
+    -- currency. The only way to total across wallets without an FX table.
+    base_amount_minor  INTEGER,
+    base_currency      TEXT,
 
-    bank_transaction_code TEXT,
-    merchant_category_code TEXT,
+    -- Running balance after this row. Powers the chain check and is often the
+    -- only thing distinguishing two otherwise identical transactions.
+    balance_minor      INTEGER,
 
-    balance_after_minor   INTEGER,
+    -- Billed separately from the amount. Usually zero, non-zero on weekend FX
+    -- and out-of-allowance ATM withdrawals. Real money either way.
+    fee_minor          INTEGER NOT NULL DEFAULT 0,
 
-    raw_json              TEXT NOT NULL,
+    -- Movements between your own accounts (FX exchanges, wallet transfers).
+    -- Counting these as spending double-counts every move, so the spend views
+    -- exclude them.
+    is_internal        INTEGER NOT NULL DEFAULT 0,
 
-    first_seen_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    last_seen_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    -- Card authorisations that have not settled. Amounts can change before
+    -- they do, so treat them as provisional.
+    is_pending         INTEGER NOT NULL DEFAULT 0,
+
+    source             TEXT NOT NULL,
+    raw_json           TEXT NOT NULL,
+
+    first_seen_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+
+    UNIQUE (account_id, row_key)
 );
-
-CREATE UNIQUE INDEX ux_transactions_booked
-    ON transactions(account_id, dedupe_key)
-    WHERE status = 'BOOK';
 
 CREATE INDEX ix_transactions_account_date ON transactions(account_id, booking_date DESC);
-CREATE INDEX ix_transactions_status       ON transactions(account_id, status);
-CREATE INDEX ix_transactions_counterparty ON transactions(counterparty_name);
+CREATE INDEX ix_transactions_description  ON transactions(description);
+CREATE INDEX ix_transactions_spend        ON transactions(is_internal, booking_date);
+CREATE INDEX ix_transactions_batch        ON transactions(batch_id);
 
 
 ------------------------------------------------------------------------------
--- Balance snapshots. Multiple types per account is normal (CLBD, ITAV, XPCD);
--- pick the one you actually want at query time rather than at write time.
+-- Balance snapshots from statement summary blocks. Independent of the
+-- transaction rows, so they reconcile against them.
 ------------------------------------------------------------------------------
-CREATE TABLE balances (
+CREATE TABLE statement_balances (
     id             INTEGER PRIMARY KEY,
     account_id     INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    batch_id       INTEGER REFERENCES import_batches(id) ON DELETE CASCADE,
 
-    balance_type   TEXT NOT NULL,
-    amount_minor   INTEGER NOT NULL,
-    amount_text    TEXT NOT NULL,
+    period_start   TEXT,
+    period_end     TEXT,
+
+    opening_minor  INTEGER,
+    closing_minor  INTEGER,
+    maximum_minor  INTEGER,
+    average_minor  INTEGER,
     currency       TEXT NOT NULL,
 
-    reference_date TEXT,
-    observed_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    recorded_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
 
-    raw_json       TEXT NOT NULL,
-
-    UNIQUE (account_id, balance_type, currency, observed_at)
-);
-
-CREATE INDEX ix_balances_account_observed ON balances(account_id, observed_at DESC);
-
-
-------------------------------------------------------------------------------
--- Per-account sync bookkeeping. Drives incremental fetching and rate-limit
--- backoff, and records whether the one-shot historical backfill has run.
-------------------------------------------------------------------------------
-CREATE TABLE account_sync_state (
-    account_id        INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
-
-    -- Set once, right after the first authorisation, using strategy=longest.
-    -- Full history is generally only reachable for ~1 hour post-auth; after
-    -- that most ASPSPs cut you back to 90 days. Do not defer this.
-    backfilled_at     TEXT,
-    earliest_booking  TEXT,
-
-    last_success_at   TEXT,
-    last_booking_date TEXT,
-
-    -- Set to now+6h on ASPSP_RATE_LIMIT_EXCEEDED. Background (no PSU headers)
-    -- fetching is commonly capped at 4/day per ASPSP.
-    next_allowed_at   TEXT,
-    consecutive_failures INTEGER NOT NULL DEFAULT 0
+    UNIQUE (account_id, period_start, period_end)
 );
 
 
-CREATE TABLE sync_runs (
-    id           INTEGER PRIMARY KEY,
-    account_id   INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
-
-    strategy     TEXT,                -- 'default' | 'longest'
-    date_from    TEXT,
-
-    started_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    finished_at  TEXT,
-
-    pages        INTEGER NOT NULL DEFAULT 0,
-    fetched      INTEGER NOT NULL DEFAULT 0,
-    inserted     INTEGER NOT NULL DEFAULT 0,
-    updated      INTEGER NOT NULL DEFAULT 0,
-
-    outcome      TEXT,                -- OK / RATE_LIMITED / EXPIRED_SESSION / ERROR
-    error        TEXT
-);
-
-CREATE INDEX ix_sync_runs_account ON sync_runs(account_id, started_at DESC);
-
-
 ------------------------------------------------------------------------------
--- Categorisation overlay. Deliberately keyed on (account_id, dedupe_key)
--- rather than transactions.id so your manual labels survive a table rebuild or
--- a re-import.
+-- Categorisation.
+--
+-- The overlay keys on (account_id, row_key) rather than transactions.id so
+-- manual labels survive replace-by-range re-imports.
 ------------------------------------------------------------------------------
 CREATE TABLE categories (
     id        INTEGER PRIMARY KEY,
     name      TEXT NOT NULL UNIQUE,
-    parent_id INTEGER REFERENCES categories(id) ON DELETE SET NULL
-);
+    parent_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
 
-CREATE TABLE transaction_categories (
-    account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-    dedupe_key  TEXT NOT NULL,
-
-    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
-    source      TEXT NOT NULL DEFAULT 'manual'  CHECK (source IN ('manual', 'rule')),
-    assigned_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-
-    PRIMARY KEY (account_id, dedupe_key)
+    -- Exclude from spending totals: transfers between your own accounts,
+    -- savings moves, credit card repayments.
+    excluded  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE category_rules (
     id          INTEGER PRIMARY KEY,
-    pattern     TEXT NOT NULL,          -- matched with LIKE against counterparty_name
     category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
-    priority    INTEGER NOT NULL DEFAULT 100
+
+    -- Matched with LIKE against description; '%TESCO%'. Lloyds and Revolut
+    -- write the same merchant differently, so expect several rules per
+    -- category.
+    pattern     TEXT NOT NULL,
+    -- Optional narrowing: only apply to one account or one source category.
+    account_id  INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
+
+    priority    INTEGER NOT NULL DEFAULT 100,   -- lower wins
+    enabled     INTEGER NOT NULL DEFAULT 1,
+
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
+CREATE INDEX ix_category_rules_priority ON category_rules(enabled, priority);
+
+CREATE TABLE transaction_categories (
+    account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    row_key     TEXT NOT NULL,
+
+    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+
+    -- 'manual' always beats 'rule'; a re-run of the rules engine must not
+    -- overwrite a hand-made decision.
+    source      TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'rule')),
+    rule_id     INTEGER REFERENCES category_rules(id) ON DELETE SET NULL,
+
+    assigned_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+
+    PRIMARY KEY (account_id, row_key)
+);
+
+CREATE INDEX ix_transaction_categories_category ON transaction_categories(category_id);
+
 
 ------------------------------------------------------------------------------
--- updated_at triggers. SQLite will not maintain these for you.
+-- Starter categories. 'excluded' ones are movements, not spending.
 ------------------------------------------------------------------------------
-CREATE TRIGGER trg_aspsps_updated
-AFTER UPDATE ON aspsps FOR EACH ROW
-BEGIN
-    UPDATE aspsps SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = OLD.id;
-END;
+INSERT INTO categories (name, excluded) VALUES
+    ('Groceries',        0),
+    ('Eating out',       0),
+    ('Transport',        0),
+    ('Shopping',         0),
+    ('Bills & utilities',0),
+    ('Subscriptions',    0),
+    ('Health',           0),
+    ('Travel',           0),
+    ('Cash',             0),
+    ('Fees',             0),
+    ('Income',           0),
+    ('Transfers',        1),
+    ('Exchange',         1),
+    ('Savings',          1);
 
-CREATE TRIGGER trg_sessions_updated
-AFTER UPDATE ON sessions FOR EACH ROW
+
+------------------------------------------------------------------------------
+-- updated_at maintenance. SQLite will not do this for you.
+------------------------------------------------------------------------------
+CREATE TRIGGER trg_institutions_updated
+AFTER UPDATE ON institutions FOR EACH ROW
 BEGIN
-    UPDATE sessions SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = OLD.id;
+    UPDATE institutions SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+     WHERE id = OLD.id;
 END;
 
 CREATE TRIGGER trg_accounts_updated
-AFTER UPDATE OF name, currency, product, cash_account_type, usage, iban, masked_pan, bban, raw_json
+AFTER UPDATE OF name, currency, account_type, identifier_tail, active
 ON accounts FOR EACH ROW
 BEGIN
-    UPDATE accounts SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = OLD.id;
+    UPDATE accounts SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+     WHERE id = OLD.id;
 END;
 
 
 ------------------------------------------------------------------------------
--- Analytics conveniences.
+-- Views.
+--
+-- gbp_minor is the figure to aggregate on: the statement's converted amount
+-- where one exists, the native amount otherwise. Summing amount_minor across
+-- accounts silently adds euros to pounds.
 ------------------------------------------------------------------------------
 CREATE VIEW v_transactions AS
 SELECT
     t.id,
     t.account_id,
-    a.display_name AS account,
-    p.name         AS bank,
-    t.status,
+    COALESCE(a.display_name, a.name, a.account_key) AS account,
+    i.name                       AS bank,
     t.booking_date,
     substr(t.booking_date, 1, 7) AS month,
+    t.description,
+    t.source_category,
     t.amount_minor / 100.0       AS amount,
     t.currency,
-    t.counterparty_name,
-    t.reference,
-    c.name AS category
+    COALESCE(t.base_amount_minor, t.amount_minor) / 100.0 AS amount_gbp,
+    t.fee_minor / 100.0          AS fee,
+    t.balance_minor / 100.0      AS balance,
+    t.is_internal,
+    t.is_pending,
+    c.name                       AS category,
+    COALESCE(c.excluded, 0)      AS category_excluded,
+    tc.source                    AS category_source,
+    t.row_key,
+    t.source
 FROM transactions t
-JOIN accounts a ON a.id = t.account_id
-JOIN aspsps   p ON p.id = a.aspsp_id
+JOIN institutions i ON i.id = (SELECT institution_id FROM accounts WHERE id = t.account_id)
+JOIN accounts a     ON a.id = t.account_id
 LEFT JOIN transaction_categories tc
-       ON tc.account_id = t.account_id AND tc.dedupe_key = t.dedupe_key
+       ON tc.account_id = t.account_id AND tc.row_key = t.row_key
 LEFT JOIN categories c ON c.id = tc.category_id;
+
+
+-- Real spending only: internal movements and excluded categories dropped.
+CREATE VIEW v_spend AS
+SELECT *
+FROM v_transactions
+WHERE is_internal = 0
+  AND category_excluded = 0;
 
 
 CREATE VIEW v_monthly_spend AS
 SELECT
-    substr(booking_date, 1, 7) AS month,
-    account_id,
-    currency,
-    SUM(CASE WHEN amount_minor < 0 THEN -amount_minor ELSE 0 END) / 100.0 AS spent,
-    SUM(CASE WHEN amount_minor > 0 THEN  amount_minor ELSE 0 END) / 100.0 AS received,
+    month,
+    account,
+    ROUND(SUM(CASE WHEN amount_gbp < 0 THEN -amount_gbp ELSE 0 END), 2) AS spent_gbp,
+    ROUND(SUM(CASE WHEN amount_gbp > 0 THEN  amount_gbp ELSE 0 END), 2) AS received_gbp,
+    ROUND(SUM(fee), 2) AS fees_gbp,
     COUNT(*) AS n
-FROM transactions
-WHERE status = 'BOOK' AND booking_date IS NOT NULL
-GROUP BY month, account_id, currency;
+FROM v_spend
+GROUP BY month, account;
+
+
+CREATE VIEW v_category_spend AS
+SELECT
+    month,
+    COALESCE(category, 'Uncategorised') AS category,
+    ROUND(SUM(CASE WHEN amount_gbp < 0 THEN -amount_gbp ELSE 0 END), 2) AS spent_gbp,
+    COUNT(*) AS n
+FROM v_spend
+GROUP BY month, COALESCE(category, 'Uncategorised');
+
+
+-- The worklist for writing rules: biggest uncategorised merchants first.
+CREATE VIEW v_uncategorised AS
+SELECT
+    description,
+    COUNT(*) AS n,
+    ROUND(SUM(CASE WHEN amount_gbp < 0 THEN -amount_gbp ELSE 0 END), 2) AS spent_gbp,
+    MIN(booking_date) AS first_seen,
+    MAX(booking_date) AS last_seen
+FROM v_spend
+WHERE category IS NULL
+GROUP BY description
+ORDER BY spent_gbp DESC;

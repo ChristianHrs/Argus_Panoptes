@@ -1,104 +1,51 @@
-mod callback;
-mod csv_import;
 mod db;
-mod enable_banking;
-mod store;
-mod sync;
+mod importer;
+mod statements;
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
-use uuid::Uuid;
-
-use enable_banking::Client;
-
-struct Config {
-    app_id: String,
-    private_key_path: String,
-    redirect_url: String,
-    database_url: String,
-    default_country: String,
-    default_bank: String,
-    psu_type: String,
-}
-
-impl Config {
-    fn from_env() -> Result<Self> {
-        Ok(Self {
-            app_id: env::var("ENABLE_BANKING_APP_ID")
-                .context("ENABLE_BANKING_APP_ID is not set")?,
-            private_key_path: env::var("ENABLE_BANKING_PRIVATE_KEY")
-                .context("ENABLE_BANKING_PRIVATE_KEY is not set")?,
-            redirect_url: env::var("REDIRECT_URL").context("REDIRECT_URL is not set")?,
-            database_url: env::var("DATABASE_URL")
-                .unwrap_or_else(|_| "sqlite://spending.db".to_string()),
-            default_country: env::var("COUNTRY").unwrap_or_else(|_| "GB".to_string()),
-            default_bank: env::var("BANK_NAME").unwrap_or_else(|_| "Mock ASPSP".to_string()),
-            psu_type: env::var("PSU_TYPE").unwrap_or_else(|_| "personal".to_string()),
-        })
-    }
-}
+use anyhow::{Context, Result};
+use sqlx::{Row, SqlitePool};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
-    let config = Config::from_env()?;
+    let database_url =
+        env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://spending.db".to_string());
 
-    let raw_args: Vec<String> = env::args().skip(1).collect();
+    ensure_parent_dir(&database_url)?;
+    let pool = db::connect(&database_url).await?;
 
-    // Flags are stripped before positional parsing so `connect --manual` and
-    // `connect "Lloyds Bank" GB --manual` both work.
-    let manual = raw_args.iter().any(|a| a == "--manual");
-    let dry_run = raw_args.iter().any(|a| a == "--dry-run");
-    let args: Vec<String> = raw_args
-        .into_iter()
-        .filter(|a| !a.starts_with("--"))
-        .collect();
-
-    let pool = {
-        ensure_parent_dir(&config.database_url)?;
-        db::connect(&config.database_url).await?
-    };
-
-    let jwt = enable_banking::create_jwt(&config.app_id, &config.private_key_path)?;
-    let api = Client::new(jwt)?;
+    let raw: Vec<String> = env::args().skip(1).collect();
+    let dry_run = raw.iter().any(|a| a == "--dry-run");
+    let args: Vec<String> = raw.into_iter().filter(|a| !a.starts_with("--")).collect();
 
     match args.first().map(String::as_str) {
-        Some("banks") => {
-            let country = args.get(1).cloned().unwrap_or(config.default_country);
-            list_banks(&api, &country).await
-        }
-
-        Some("connect") => {
-            let bank = args.get(1).cloned().unwrap_or(config.default_bank.clone());
-            let country = args.get(2).cloned().unwrap_or(config.default_country.clone());
-            connect(&pool, &api, &config, &bank, &country, manual).await
-        }
-
-        Some("sync") => sync::sync_all(&pool, &api).await,
-
         Some("import") => {
-            let file = args
+            let target = args
                 .get(1)
-                .context("usage: import <statement.csv> [--dry-run]")?;
-            import(&pool, std::path::Path::new(file), dry_run).await
+                .context("usage: import <file.csv | directory> [--dry-run]")?;
+            import(&pool, Path::new(target), dry_run).await
         }
 
-        Some("accounts") => list_accounts(&pool).await,
+        Some("inspect") => {
+            let target = args.get(1).context("usage: inspect <file.csv>")?;
+            inspect(Path::new(target))
+        }
+
+        Some("accounts") => accounts(&pool).await,
+        Some("batches") => batches(&pool).await,
 
         _ => {
             println!(
                 "usage:\n  \
-                 banks [country]              list ASPSPs\n  \
-                 connect [bank] [country]     authorise a bank and backfill history\n    \
-                 --manual                   paste the redirect URL instead of \
-                 running a local callback server\n  \
-                 sync                         incremental transaction sync\n  \
-                 import <file.csv>            import a Revolut consolidated statement\n    \
-                 --dry-run                  parse and verify without writing\n  \
-                 accounts                     show stored accounts"
+                 import <file|dir>   import bank statement CSVs (bank auto-detected)\n    \
+                 --dry-run         parse and verify without writing\n  \
+                 inspect <file>      show structure of an unrecognised file\n  \
+                 accounts            stored accounts and coverage\n  \
+                 batches             import history"
             );
             Ok(())
         }
@@ -106,169 +53,137 @@ async fn main() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// connect
+// import
 // ---------------------------------------------------------------------------
 
-async fn connect(
-    pool: &sqlx::SqlitePool,
-    api: &Client,
-    config: &Config,
-    bank_name: &str,
-    country: &str,
-    manual: bool,
-) -> Result<()> {
-    // Always resolve the bank fresh. There is no stable ASPSP identifier and
-    // names change on rebrand, so a hardcoded name eventually 404s.
-    let aspsps = api.aspsps(Some(country)).await?;
-
-    let aspsp = aspsps
-        .iter()
-        .find(|a| a.name.eq_ignore_ascii_case(bank_name))
-        .with_context(|| {
-            format!(
-                "'{bank_name}' not found in {country}. Available: {}",
-                aspsps
-                    .iter()
-                    .map(|a| a.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?;
-
-    let valid_until = aspsp.max_valid_until();
-
-    println!(
-        "{} ({}) — requesting consent until {}",
-        aspsp.name,
-        aspsp.country,
-        valid_until.format("%Y-%m-%d")
-    );
-
-    let aspsp_id = store::upsert_aspsp(
-        pool,
-        &aspsp.name,
-        &aspsp.country,
-        &config.psu_type,
-        aspsp.maximum_consent_validity,
-    )
-    .await?;
-
-    // In manual mode there is nothing to listen on: production applications
-    // reject http redirect URLs, so the bank sends the code to a public https
-    // address and it gets pasted back in here.
-    let callback_receiver = if manual {
-        None
-    } else {
-        let port = callback_port(&config.redirect_url)?;
-        Some(callback::start_callback_server(port).await?)
-    };
-
-    let state = Uuid::new_v4().to_string();
-
-    let authorization = api
-        .start_authorization(
-            aspsp,
-            &config.redirect_url,
-            &state,
-            valid_until,
-            &config.psu_type,
-        )
-        .await?;
-
-    // Persisted before the browser opens, so a crash mid-flow leaves a
-    // recoverable record rather than an orphaned consent at the bank.
-    let authorization_row_id = store::record_authorization(
-        pool,
-        aspsp_id,
-        &state,
-        &authorization.authorization_id,
-        authorization.psu_id_hash.as_deref(),
-        &valid_until.to_rfc3339(),
-    )
-    .await?;
-
-    println!("Authorization {}", authorization.authorization_id);
-
-    let callback = match callback_receiver {
-        Some(receiver) => {
-            if webbrowser::open(&authorization.url).is_err() {
-                println!("Open this URL manually:\n  {}", authorization.url);
-            }
-
-            println!("Waiting for the bank to redirect back...");
-
-            receiver
-                .await
-                .context("callback server stopped unexpectedly")?
-        }
-
-        None => read_callback_from_stdin(&authorization.url).await?,
-    };
-
-    if let Some(error) = callback.error {
-        let description = callback.error_description.unwrap_or_default();
-        store::fail_authorization(pool, authorization_row_id, &error, Some(&description)).await?;
-        bail!("bank authorization failed: {error}: {description}");
+async fn import(pool: &SqlitePool, target: &Path, dry_run: bool) -> Result<()> {
+    if dry_run {
+        println!("Dry run — nothing will be written.\n");
     }
 
-    // A pasted bare code carries no state. The CSRF risk the state parameter
-    // defends against does not apply when a human moved the value by hand, so
-    // it is validated when present and skipped when not.
-    match callback.state.as_deref() {
-        Some(returned_state) => {
-            // Checked against the database rather than a local variable, so
-            // this still works if the callback arrives after a restart.
-            let matched = store::find_pending_authorization(pool, returned_state).await?;
+    for path in collect_csv_files(target)? {
+        println!("{}", path.display());
 
-            if matched != Some(authorization_row_id) {
-                store::fail_authorization(pool, authorization_row_id, "state_mismatch", None)
-                    .await?;
-                bail!("authorization state mismatch — possible CSRF, refusing to continue");
+        let reports = match importer::import_file(pool, &path, dry_run).await {
+            Ok(reports) => reports,
+            Err(error) => {
+                eprintln!("  skipped: {error:#}\n");
+                continue;
+            }
+        };
+
+        for report in &reports {
+            let period = report
+                .period
+                .map(|(from, to)| format!("{from} to {to}"))
+                .unwrap_or_else(|| "unknown period".into());
+
+            let written = if dry_run {
+                String::new()
+            } else {
+                format!("  ({} written, {} replaced)", report.inserted, report.replaced)
+            };
+
+            println!(
+                "  [{}] {:<16} {:>4} rows  {period}{written}",
+                report.label, report.account, report.parsed
+            );
+
+            match (report.chain_available, report.chain_breaks.is_empty()) {
+                (false, _) => {
+                    // Credit card exports have no running balance, so a
+                    // dropped row cannot be detected. Say so rather than
+                    // implying the import was verified.
+                    println!("       no balance column — completeness unverified");
+                }
+                (true, true) => {
+                    let closing = report
+                        .closing_balance
+                        .map(|b| format!(", closing {:.2}", b as f64 / 100.0))
+                        .unwrap_or_default();
+                    println!("       balance chain verified{closing}");
+                }
+                (true, false) => {
+                    println!(
+                        "       BALANCE CHAIN BROKEN at {} point(s):",
+                        report.chain_breaks.len()
+                    );
+                    for issue in report.chain_breaks.iter().take(5) {
+                        println!("         {issue}");
+                    }
+                }
             }
         }
-        None if manual => println!("No state in the pasted value; skipping the CSRF check."),
-        None => {
-            store::fail_authorization(pool, authorization_row_id, "missing_state", None).await?;
-            bail!("callback did not contain state");
-        }
+
+        println!();
     }
 
-    let code = callback.code.context("callback did not contain code")?;
+    Ok(())
+}
 
-    let session_body = api.authorize_session(&code).await?;
-    let raw = serde_json::to_string(&session_body)?;
+/// A file or a directory, so a backlog of monthly exports imports in one go.
+fn collect_csv_files(target: &Path) -> Result<Vec<PathBuf>> {
+    if target.is_file() {
+        return Ok(vec![target.to_path_buf()]);
+    }
 
-    let saved = store::save_session(
-        pool,
-        aspsp_id,
-        Some(authorization_row_id),
-        &session_body,
-        &raw,
-    )
-    .await?;
+    if !target.is_dir() {
+        anyhow::bail!("{} is neither a file nor a directory", target.display());
+    }
 
-    println!("Session saved with {} account(s)", saved.accounts.len());
+    let mut files: Vec<PathBuf> = std::fs::read_dir(target)?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("csv")))
+        .collect();
 
-    if saved.accounts.is_empty() {
+    files.sort();
+
+    if files.is_empty() {
+        anyhow::bail!("no CSV files in {}", target.display());
+    }
+
+    Ok(files)
+}
+
+// ---------------------------------------------------------------------------
+// inspect
+// ---------------------------------------------------------------------------
+
+/// Dumps enough structure to write or fix a parser, without printing amounts
+/// and merchant names for the whole file.
+fn inspect(path: &Path) -> Result<()> {
+    let records = statements::read_records(path)?;
+
+    println!("{}\n{} rows\n", path.display(), records.len());
+
+    for parser in statements::parsers() {
         println!(
-            "No accounts returned. On a restricted production app this means the \
-             account was not linked to the application beforehand."
+            "  {:<10} {}",
+            parser.label(),
+            if parser.detect(&records) {
+                "MATCHES"
+            } else {
+                "no"
+            }
         );
-        return Ok(());
     }
 
-    // Immediately, not on the next scheduled run: full history is generally
-    // only reachable for about an hour after authorisation.
-    println!("\nBackfilling history while the full window is still open...");
+    println!("\nFirst 12 rows:\n");
 
-    for (account_id, uid) in &saved.accounts {
-        match sync::sync_account(pool, api, *account_id, uid).await {
-            Ok(outcome) => println!(
-                "  {uid}: {} pages, {} transactions",
-                outcome.pages, outcome.fetched
-            ),
-            Err(error) => eprintln!("  {uid}: backfill failed: {error:#}"),
-        }
+    for (index, row) in records.iter().take(12).enumerate() {
+        let cells: Vec<String> = row
+            .iter()
+            .map(|c| {
+                let trimmed = c.trim();
+                if trimmed.len() > 24 {
+                    format!("{}…", &trimmed[..24])
+                } else {
+                    trimmed.to_string()
+                }
+            })
+            .collect();
+
+        println!("  {index:>3}: {}", cells.join(" | "));
     }
 
     Ok(())
@@ -278,241 +193,90 @@ async fn connect(
 // read-only commands
 // ---------------------------------------------------------------------------
 
-async fn list_banks(api: &Client, country: &str) -> Result<()> {
-    let mut aspsps = api.aspsps(Some(country)).await?;
-    aspsps.sort_by(|a, b| a.name.cmp(&b.name));
-
-    println!("{} ASPSPs in {}", aspsps.len(), country.to_uppercase());
-
-    for aspsp in aspsps {
-        let days = aspsp
-            .maximum_consent_validity
-            .map(|s| format!("{}d", s / 86400))
-            .unwrap_or_else(|| "?".to_string());
-
-        println!(
-            "  {:<45} consent {:<5} {}{}",
-            aspsp.name,
-            days,
-            aspsp.psu_types.join("/"),
-            if aspsp.beta { "  [beta]" } else { "" }
-        );
-    }
-
-    Ok(())
-}
-
-async fn list_accounts(pool: &sqlx::SqlitePool) -> Result<()> {
-    let rows = sqlx::query_as::<
-        _,
-        (String, String, Option<String>, i64, Option<String>, Option<String>, Option<String>),
-    >(
+async fn accounts(pool: &SqlitePool) -> Result<()> {
+    let rows = sqlx::query(
         r#"
-        SELECT p.name,
-               COALESCE(a.display_name, a.name, a.identification_hash),
+        SELECT i.name AS bank,
+               COALESCE(a.display_name, a.account_key) AS label,
                a.currency,
-               (SELECT COUNT(*) FROM transactions t WHERE t.account_id = a.id),
-               st.last_success_at,
-               (SELECT MAX(s.valid_until)
-                  FROM sessions s
-                  JOIN session_accounts sa ON sa.session_id = s.id
-                 WHERE sa.account_id = a.id AND s.status = 'AUTHORIZED'),
-               (SELECT MIN(t.booking_date) FROM transactions t WHERE t.account_id = a.id)
+               a.account_type,
+               COUNT(t.id)         AS n,
+               MIN(t.booking_date) AS first_txn,
+               MAX(t.booking_date) AS last_txn
           FROM accounts a
-          JOIN aspsps p ON p.id = a.aspsp_id
-     LEFT JOIN account_sync_state st ON st.account_id = a.id
-         ORDER BY p.name, a.id
+          JOIN institutions i ON i.id = a.institution_id
+     LEFT JOIN transactions t ON t.account_id = a.id
+         WHERE a.active = 1
+         GROUP BY a.id
+         ORDER BY i.name, n DESC
         "#,
     )
     .fetch_all(pool)
     .await?;
 
     if rows.is_empty() {
-        println!("No accounts stored yet.");
+        println!("No accounts yet. Run `import <file.csv>`.");
         return Ok(());
     }
 
-    let today = chrono::Utc::now().date_naive();
-
-    for (bank, name, currency, count, last_sync, valid_until, earliest) in rows {
+    for row in rows {
         println!(
-            "  {:<20} {:<28} {:<4} {:>6} txns since {}",
-            bank,
-            name,
-            currency.unwrap_or_default(),
-            count,
-            earliest.unwrap_or_else(|| "-".to_string())
+            "  {:<10} {:<18} {:<12} {:>5} txns  {} to {}",
+            row.get::<String, _>("bank"),
+            row.get::<String, _>("label"),
+            row.get::<String, _>("account_type"),
+            row.get::<i64, _>("n"),
+            row.get::<Option<String>, _>("first_txn")
+                .unwrap_or_else(|| "-".into()),
+            row.get::<Option<String>, _>("last_txn")
+                .unwrap_or_else(|| "-".into()),
         );
-
-        println!(
-            "  {:<20} last sync {}",
-            "",
-            last_sync.unwrap_or_else(|| "never".to_string())
-        );
-
-        // Consent expiry is silent when it arrives: the sync just stops
-        // returning new data. Surface the countdown.
-        match valid_until.as_deref() {
-            Some(raw) => {
-                let days = raw
-                    .get(..10)
-                    .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-                    .map(|d| (d - today).num_days());
-
-                let note = match days {
-                    Some(d) if d < 0 => "  EXPIRED — run `connect` again".to_string(),
-                    Some(d) if d <= 14 => format!("  {d} days left — renew soon"),
-                    Some(d) => format!("  {d} days left"),
-                    None => String::new(),
-                };
-
-                println!("  {:<20} consent until {}{}", "", &raw[..10.min(raw.len())], note);
-            }
-            None => println!("  {:<20} consent expiry not reported by this ASPSP", ""),
-        }
-
-        println!();
     }
 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
+async fn batches(pool: &SqlitePool) -> Result<()> {
+    let rows = sqlx::query(
+        r#"
+        SELECT b.imported_at, b.source, b.period_start, b.period_end,
+               b.rows_inserted, b.chain_verified, b.chain_breaks,
+               COALESCE(a.display_name, a.account_key) AS label
+          FROM import_batches b
+          LEFT JOIN accounts a ON a.id = b.account_id
+         ORDER BY b.imported_at DESC, label
+         LIMIT 40
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
 
-async fn import(pool: &sqlx::SqlitePool, path: &std::path::Path, dry_run: bool) -> Result<()> {
-    if dry_run {
-        println!("Dry run — nothing will be written.\n");
+    if rows.is_empty() {
+        println!("Nothing imported yet.");
+        return Ok(());
     }
 
-    let reports = csv_import::import_file(pool, path, dry_run).await?;
-
-    for report in &reports {
-        let period = report
-            .period
-            .map(|(from, to)| format!("{from} to {to}"))
-            .unwrap_or_else(|| "unknown period".to_string());
+    for row in rows {
+        let breaks = row.get::<i64, _>("chain_breaks");
 
         println!(
-            "  {:<4} {:>4} rows  {}{}",
-            report.currency,
-            report.parsed,
-            period,
-            if dry_run {
-                String::new()
+            "  {}  {:<16} {} to {}  {:>4} rows  {}",
+            &row.get::<String, _>("imported_at")[..16],
+            row.get::<String, _>("label"),
+            row.get::<Option<String>, _>("period_start").unwrap_or_default(),
+            row.get::<Option<String>, _>("period_end").unwrap_or_default(),
+            row.get::<i64, _>("rows_inserted"),
+            if breaks > 0 {
+                format!("{breaks} CHAIN BREAKS")
+            } else if row.get::<i64, _>("chain_verified") == 1 {
+                "verified".to_string()
             } else {
-                format!("  ({} inserted, {} replaced)", report.inserted, report.deleted)
+                "unverified".to_string()
             }
         );
-
-        // A break means the export dropped or reordered rows. Surfaced loudly
-        // because everything downstream silently inherits the gap.
-        if report.chain_breaks.is_empty() {
-            println!("       balance chain verified");
-        } else {
-            println!(
-                "       BALANCE CHAIN BROKEN at {} point(s):",
-                report.chain_breaks.len()
-            );
-            for issue in report.chain_breaks.iter().take(5) {
-                println!("         {issue}");
-            }
-        }
     }
-
-    let total: usize = reports.iter().map(|r| r.parsed).sum();
-    println!("\n{total} transactions across {} wallet(s)", reports.len());
 
     Ok(())
-}
-
-/// Manual paste flow. Accepts either the whole redirected URL or a bare code.
-async fn read_callback_from_stdin(auth_url: &str) -> Result<callback::AuthCallback> {
-    println!("\nOpen this URL and authorise:\n\n  {auth_url}\n");
-    println!(
-        "The bank will redirect to a page that may not load — that is fine. \
-         Copy the full URL from the address bar and paste it here\n\
-         (a bare code works too), then press enter:\n"
-    );
-
-    let line = tokio::task::spawn_blocking(|| {
-        use std::io::BufRead;
-        let mut buffer = String::new();
-        std::io::stdin().lock().read_line(&mut buffer)?;
-        Ok::<_, std::io::Error>(buffer)
-    })
-    .await??;
-
-    let input = line.trim();
-
-    if input.is_empty() {
-        bail!("nothing pasted");
-    }
-
-    // Bare code: no query string to pick apart.
-    if !input.contains('=') {
-        return Ok(callback::AuthCallback {
-            code: Some(input.to_string()),
-            state: None,
-            error: None,
-            error_description: None,
-        });
-    }
-
-    let query = input.split_once('?').map(|(_, q)| q).unwrap_or(input);
-    let params = parse_query(query);
-
-    Ok(callback::AuthCallback {
-        code: params.get("code").cloned(),
-        state: params.get("state").cloned(),
-        error: params.get("error").cloned(),
-        error_description: params.get("error_description").cloned(),
-    })
-}
-
-fn parse_query(query: &str) -> std::collections::HashMap<String, String> {
-    query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .map(|(key, value)| (key.to_string(), percent_decode(value)))
-        .collect()
-}
-
-/// Minimal percent-decoding. Authorization codes are usually URL-safe, but
-/// error_description is prose and will contain encoded spaces.
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
-                match u8::from_str_radix(hex, 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            byte => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// create_if_missing creates the database file, not the directory holding it.
@@ -531,20 +295,4 @@ fn ensure_parent_dir(database_url: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Derive the listen port from REDIRECT_URL so the two cannot drift apart.
-fn callback_port(redirect_url: &str) -> Result<u16> {
-    let after_scheme = redirect_url
-        .split("://")
-        .nth(1)
-        .context("REDIRECT_URL has no scheme")?;
-
-    let host_port = after_scheme.split('/').next().unwrap_or_default();
-
-    Ok(match host_port.rsplit_once(':') {
-        Some((_, port)) => port.parse().context("REDIRECT_URL has a bad port")?,
-        None if redirect_url.starts_with("https") => 443,
-        None => 80,
-    })
 }
