@@ -172,6 +172,7 @@ pub fn parse_date(raw: &str) -> Option<NaiveDate> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Savings is unused until a savings account shows up
 pub enum AccountType {
     Current,
     Savings,
