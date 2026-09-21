@@ -82,7 +82,11 @@ impl StatementParser for RevolutCsv {
                 continue;
             };
 
+            // Past the structural filters above, anything left is meant to be
+            // a transaction. Failing to parse one is a parser problem, not a
+            // formatting quirk, so it is recorded rather than dropped.
             let Some(date) = row.get(cols.date).and_then(|c| parse_date(c)) else {
+                account.skip(row);
                 continue;
             };
 
@@ -91,6 +95,7 @@ impl StatementParser for RevolutCsv {
             let Some((amount_minor, amount_text, row_currency)) =
                 row.get(cols.amount).and_then(|c| money_minor(c, &currency))
             else {
+                account.skip(row);
                 continue;
             };
 

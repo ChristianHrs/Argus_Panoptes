@@ -89,6 +89,13 @@ async fn import(pool: &SqlitePool, target: &Path, dry_run: bool) -> Result<()> {
                 report.label, report.account, report.parsed
             );
 
+            if !report.skipped.is_empty() {
+                println!("       {} ROW(S) NOT PARSED:", report.skipped.len());
+                for row in report.skipped.iter().take(5) {
+                    println!("         {row}");
+                }
+            }
+
             match (report.chain_available, report.chain_breaks.is_empty()) {
                 (false, _) => {
                     // Credit card exports have no running balance, so a

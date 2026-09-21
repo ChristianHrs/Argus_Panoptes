@@ -114,8 +114,13 @@ impl StatementParser for LloydsCsv {
             let (amount_minor, amount_text) = match (debit, credit) {
                 (Some((minor, text, _)), _) if minor != 0 => (-minor.abs(), format!("-{text}")),
                 (_, Some((minor, text, _))) if minor != 0 => (minor.abs(), text),
-                // A zero-value row is not a transaction.
-                _ => continue,
+                // Both columns empty or zero. Recorded, because if this ever
+                // happens on a real transaction the balance chain will break
+                // and there would otherwise be nothing to point at.
+                _ => {
+                    account.skip(row);
+                    continue;
+                }
             };
 
             let transaction_type = cols

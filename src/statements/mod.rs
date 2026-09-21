@@ -255,6 +255,7 @@ impl ParsedRow {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Savings is unused until a savings account shows up
 pub struct ParsedAccount {
     /// Stable synthetic identity. Must be derivable from any export of this
     /// account, or history fragments across files.
@@ -270,8 +271,16 @@ pub struct ParsedAccount {
     pub rows: Vec<ParsedRow>,
     pub opening_balance_minor: Option<i64>,
     pub closing_balance_minor: Option<i64>,
+
+    /// Rows that looked like data but could not be parsed.
+    ///
+    /// A silently dropped row breaks the balance chain and nothing else, so
+    /// without this the two are indistinguishable from the bank omitting a
+    /// transaction. Kept verbatim for inspection.
+    pub skipped: Vec<String>,
 }
 
+#[allow(dead_code)] // Savings is unused until a savings account shows up
 impl ParsedAccount {
     pub fn new(
         account_key: impl Into<String>,
@@ -291,6 +300,16 @@ impl ParsedAccount {
             rows: Vec::new(),
             opening_balance_minor: None,
             closing_balance_minor: None,
+            skipped: Vec::new(),
+        }
+    }
+
+    /// Record a row the parser could not use. Truncated: these are only ever
+    /// read by a human diagnosing a chain break.
+    pub fn skip(&mut self, row: &[String]) {
+        if self.skipped.len() < 20 {
+            let text = row.join(" | ");
+            self.skipped.push(text.chars().take(120).collect());
         }
     }
 

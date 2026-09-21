@@ -29,6 +29,9 @@ pub struct ImportReport {
     pub chain_breaks: Vec<String>,
     pub chain_available: bool,
     pub closing_balance: Option<i64>,
+    /// Rows the parser could not read. A non-empty list alongside a chain
+    /// break means the fault is here, not in the statement.
+    pub skipped: Vec<String>,
 }
 
 pub async fn import_file(
@@ -58,6 +61,7 @@ pub async fn import_file(
             chain_available: has_balance_chain(account),
             chain_breaks: verify_chain(account),
             closing_balance: account.closing_balance_minor,
+            skipped: account.skipped.clone(),
             ..Default::default()
         };
 
