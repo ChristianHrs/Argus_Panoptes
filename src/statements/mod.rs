@@ -162,9 +162,28 @@ pub fn parse_date(raw: &str) -> Option<NaiveDate> {
         "%d %B %Y",
     ];
 
-    FORMATS
-        .iter()
-        .find_map(|fmt| NaiveDate::parse_from_str(text, fmt).ok())
+    let attempt = |text: &str| {
+        FORMATS
+            .iter()
+            .find_map(|fmt| NaiveDate::parse_from_str(text, fmt).ok())
+    };
+
+    if let Some(date) = attempt(text) {
+        return Some(date);
+    }
+
+    // Revolut abbreviates September to "Sept" — four letters, where every
+    // other month gets three. chrono's %b expects "Sep", so without this
+    // every September row in a Revolut export is silently dropped and the
+    // balance chain breaks at the next transaction.
+    //
+    // The trailing space matters: a bare "Sept" replacement would mangle the
+    // full "September" that %B handles correctly above.
+    if text.contains("Sept ") {
+        return attempt(&text.replace("Sept ", "Sep "));
+    }
+
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +274,6 @@ impl ParsedRow {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // Savings is unused until a savings account shows up
 pub struct ParsedAccount {
     /// Stable synthetic identity. Must be derivable from any export of this
     /// account, or history fragments across files.
@@ -280,7 +298,6 @@ pub struct ParsedAccount {
     pub skipped: Vec<String>,
 }
 
-#[allow(dead_code)] // Savings is unused until a savings account shows up
 impl ParsedAccount {
     pub fn new(
         account_key: impl Into<String>,
@@ -539,6 +556,25 @@ mod tests {
         assert_eq!(
             parse_date("1 Jul 2026"),
             Some(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap())
+        );
+    }
+
+    /// Revolut's four-letter September. Dropping these rows breaks the
+    /// balance chain and loses real transactions.
+    #[test]
+    fn revolut_writes_september_with_four_letters() {
+        assert_eq!(
+            parse_date("6 Sept 2024"),
+            Some(NaiveDate::from_ymd_opt(2024, 9, 6).unwrap())
+        );
+        assert_eq!(
+            parse_date("1 Sept 2025"),
+            Some(NaiveDate::from_ymd_opt(2025, 9, 1).unwrap())
+        );
+        // The full month name must still work.
+        assert_eq!(
+            parse_date("1 September 2025"),
+            Some(NaiveDate::from_ymd_opt(2025, 9, 1).unwrap())
         );
     }
 }
