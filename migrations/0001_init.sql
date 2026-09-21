@@ -214,11 +214,17 @@ CREATE TABLE category_rules (
     id          INTEGER PRIMARY KEY,
     category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
 
-    -- Matched with LIKE against description; '%TESCO%'. Lloyds and Revolut
-    -- write the same merchant differently, so expect several rules per
-    -- category.
+    -- Matched with LIKE; '%TESCO%'. Lloyds and Revolut write the same
+    -- merchant differently, so expect several rules per category.
     pattern     TEXT NOT NULL,
-    -- Optional narrowing: only apply to one account or one source category.
+
+    -- Which column to match against. Amex supplies a machine-generated
+    -- merchant category ('Travel-Travel Agencies'), so one rule on
+    -- source_category can replace dozens of merchant-name rules.
+    match_field TEXT NOT NULL DEFAULT 'description'
+                CHECK (match_field IN ('description', 'source_category')),
+
+    -- Optional narrowing to a single account.
     account_id  INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
 
     priority    INTEGER NOT NULL DEFAULT 100,   -- lower wins
@@ -228,6 +234,12 @@ CREATE TABLE category_rules (
 );
 
 CREATE INDEX ix_category_rules_priority ON category_rules(enabled, priority);
+
+-- Makes the seed file idempotent: re-running it with INSERT OR IGNORE adds
+-- only what is new. IFNULL is needed because SQLite treats NULLs as distinct
+-- in a UNIQUE constraint, so account-wide rules would otherwise duplicate.
+CREATE UNIQUE INDEX ux_category_rules
+    ON category_rules(pattern, match_field, IFNULL(account_id, -1));
 
 CREATE TABLE transaction_categories (
     account_id  INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,

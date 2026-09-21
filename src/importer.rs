@@ -180,7 +180,7 @@ async fn write_account(
         .bind(row.date.to_string())
         .bind(&row.description)
         .bind(row.category.as_deref())
-        .bind(row.reference.as_deref())
+        .bind(row.external_id.as_deref().or(row.reference.as_deref()))
         .bind(row.amount_minor)
         .bind(&row.amount_text)
         .bind(&row.currency)
@@ -201,6 +201,8 @@ async fn write_account(
                 "currency": row.currency,
                 "balance_minor": row.balance_minor,
                 "fee_minor": row.fee_minor,
+                "external_id": row.external_id,
+                "details": row.details,
             })
             .to_string(),
         )
