@@ -1,3 +1,4 @@
+mod categorise;
 mod db;
 mod importer;
 mod statements;
@@ -20,6 +21,7 @@ async fn main() -> Result<()> {
 
     let raw: Vec<String> = env::args().skip(1).collect();
     let dry_run = raw.iter().any(|a| a == "--dry-run");
+    let reset = raw.iter().any(|a| a == "--reset");
     let args: Vec<String> = raw.into_iter().filter(|a| !a.starts_with("--")).collect();
 
     match args.first().map(String::as_str) {
@@ -35,6 +37,20 @@ async fn main() -> Result<()> {
             inspect(Path::new(target))
         }
 
+        Some("categorise") | Some("categorize") => {
+            categorise::run(&pool, reset, dry_run).await
+        }
+
+        Some("tag") => {
+            let id: i64 = args
+                .get(1)
+                .context("usage: tag <transaction-id> <category>")?
+                .parse()
+                .context("transaction id must be a number")?;
+            let category = args.get(2).context("usage: tag <transaction-id> <category>")?;
+            categorise::assign_manual(&pool, id, category).await
+        }
+
         Some("accounts") => accounts(&pool).await,
         Some("batches") => batches(&pool).await,
 
@@ -44,6 +60,10 @@ async fn main() -> Result<()> {
                  import <file|dir>   import bank statement CSVs (bank auto-detected)\n    \
                  --dry-run         parse and verify without writing\n  \
                  inspect <file>      show structure of an unrecognised file\n  \
+                 categorise          apply rules to uncategorised transactions\n    \
+                 --reset           re-apply from scratch, keeping manual tags\n    \
+                 --dry-run         show what would be assigned\n  \
+                 tag <id> <cat>      set a category by hand\n  \
                  accounts            stored accounts and coverage\n  \
                  batches             import history"
             );
