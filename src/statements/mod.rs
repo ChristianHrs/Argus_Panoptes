@@ -196,6 +196,18 @@ pub struct ParsedRow {
     pub category: Option<String>,
     pub reference: Option<String>,
 
+    /// A transaction identifier supplied by the bank, when there is one.
+    ///
+    /// Amex gives one on every row. It beats the positional fallback outright:
+    /// it is stable across exports of any date range, so manual categories
+    /// stay attached permanently. Revolut and Lloyds give nothing usable.
+    pub external_id: Option<String>,
+
+    /// Anything the source carries that has no column of its own — Amex's
+    /// "Extended Details" holds foreign spend amounts. Kept in raw_json so it
+    /// can be mined later without re-importing.
+    pub details: Option<String>,
+
     pub amount_text: String,
     /// Signed in OUR convention throughout: money out is negative, whatever
     /// the source file did. Credit card exports are normalised here, not
@@ -220,6 +232,13 @@ pub struct ParsedRow {
 
 impl ParsedRow {
     pub fn row_key(&self, source: &str) -> String {
+        // A bank-supplied identifier is always preferable: the composite below
+        // depends on an ordinal, which is stable but only because identical
+        // rows are counted per day rather than per file.
+        if let Some(id) = self.external_id.as_deref().filter(|id| !id.is_empty()) {
+            return format!("{source}:id:{id}");
+        }
+
         format!(
             "{}:{}:{}:{}:{}:{}",
             source,
@@ -294,6 +313,26 @@ impl ParsedAccount {
         dates.sort_unstable();
         Some((*dates.first()?, *dates.last()?))
     }
+}
+
+/// Normalise to oldest-first.
+///
+/// Lloyds and Amex both export newest-first. Reversing rather than sorting by
+/// date is deliberate: it preserves the order of same-day transactions, which
+/// a date sort would scramble — and that order is what makes the running
+/// balance verifiable at all.
+pub fn ensure_chronological(rows: &mut [ParsedRow]) -> bool {
+    let (Some(first), Some(last)) = (rows.first().map(|r| r.date), rows.last().map(|r| r.date))
+    else {
+        return false;
+    };
+
+    if first > last {
+        rows.reverse();
+        return true;
+    }
+
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +460,9 @@ pub fn parse_file(path: &Path) -> Result<Detected> {
         let mut accounts = parser.parse(&records)?;
 
         for account in &mut accounts {
+            // Order first: both the ordinals and the inferred opening balance
+            // depend on rows running oldest-first.
+            ensure_chronological(&mut account.rows);
             assign_ordinals(&mut account.rows);
             account.infer_balances();
         }

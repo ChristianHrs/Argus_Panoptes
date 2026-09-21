@@ -1,32 +1,34 @@
 //! American Express CSV export.
 //!
-//! UNVERIFIED, and the loosest of the three parsers — Amex's export columns
-//! vary by region and by whether extended details were included. Detection is
-//! therefore deliberately last in the registry: it only sees files the other
-//! parsers declined.
+//! Verified against a real UK export with the header:
 //!
-//! Two things make credit cards different from bank accounts:
+//!   Date, Description, Amount, Extended Details,
+//!   Appears On Your Statement As, Address, Town/City, Postcode, Country,
+//!   Reference, Category
 //!
-//! 1. SIGN CONVENTION IS INVERTED. Amex exports a purchase as a POSITIVE
-//!    amount (an increase in what you owe) and a refund or payment as
-//!    negative. Every other source here treats money leaving you as negative.
-//!    Rows are flipped at parse time so the rest of the system never has to
-//!    care — but if a "spend" total ever comes out negative, this is the
-//!    first thing to check against a real file.
+//! Two things make a credit card unlike a bank account:
 //!
-//! 2. NO RUNNING BALANCE. So `verify_chain` has nothing to check and an
-//!    export that silently drops rows will not be detected. Reconcile against
-//!    the statement total manually.
+//! 1. SIGN CONVENTION IS INVERTED. A purchase exports as a POSITIVE amount
+//!    (it increases what you owe); refunds and payments are negative. Every
+//!    other source treats money leaving you as negative, so rows are flipped
+//!    here and the rest of the system never has to know. If a spend total
+//!    ever comes out negative, this is the first place to look.
+//!
+//! 2. NO RUNNING BALANCE. `verify_chain` has nothing to check, so a dropped
+//!    row cannot be detected. Reconcile against the statement total by eye.
+//!
+//! Unlike the other two sources, Amex supplies a per-transaction Reference,
+//! which is used as the row identity.
 
 use anyhow::{anyhow, Result};
 
 use super::{money_minor, parse_date, AccountType, ParsedAccount, ParsedRow, StatementParser};
 
-/// Payments to the card are transfers from another account you own, not
-/// spending. Matched loosely because the wording varies.
+/// Payments to the card are money moving from another account you own, and
+/// the spending was already counted when the purchase was made.
 const PAYMENT_MARKERS: [&str; 4] = [
     "PAYMENT RECEIVED",
-    "PAYMENT - THANK YOU",
+    "THANK YOU",
     "DIRECT DEBIT",
     "ONLINE PAYMENT",
 ];
@@ -43,12 +45,11 @@ impl StatementParser for AmexCsv {
     }
 
     fn detect(&self, records: &[Vec<String>]) -> bool {
-        // A date column, an amount column, and no separate debit/credit pair
-        // (which would make it Lloyds-shaped).
         header_row(records)
             .map(|(_, header)| {
                 find(header, "Date").is_some()
                     && find(header, "Amount").is_some()
+                    // A debit/credit pair would make it Lloyds-shaped.
                     && find(header, "Debit Amount").is_none()
             })
             .unwrap_or(false)
@@ -61,28 +62,16 @@ impl StatementParser for AmexCsv {
         let cols = Columns::from_header(header)
             .ok_or_else(|| anyhow!("Amex header missing a date or amount column"))?;
 
-        let card_tail = cols
-            .card
-            .and_then(|i| records.get(header_index + 1).and_then(|r| r.get(i)))
-            .map(|c| last_four(c))
-            .filter(|t| !t.is_empty());
-
-        let key = match &card_tail {
-            Some(tail) => format!("amex:gb:{tail}"),
-            None => "amex:gb:card".to_string(),
-        };
-
+        // This export carries no card number, so one key serves. Add a
+        // discriminator here if a second Amex card ever appears, or the two
+        // will merge into one account.
         let mut account = ParsedAccount::new(
-            key,
+            "amex:gb:card",
             "Amex",
             "GBP",
-            match &card_tail {
-                Some(tail) => format!("Amex ...{tail}"),
-                None => "Amex".to_string(),
-            },
+            "Amex",
             AccountType::CreditCard,
         );
-        account.identifier_tail = card_tail;
 
         for row in &records[header_index + 1..] {
             let Some(date) = row.get(cols.date).and_then(|c| parse_date(c)) else {
@@ -95,41 +84,48 @@ impl StatementParser for AmexCsv {
                 continue;
             };
 
-            // The inversion. Amex positive = you spent it = negative for us.
+            // The inversion. Amex positive means you spent it.
             let amount_minor = -raw_minor;
-            let amount_text = format!("{:.2}", amount_minor as f64 / 100.0);
 
             let description = cols
                 .description
                 .and_then(|i| row.get(i))
-                .map(|c| c.trim().to_string())
+                .map(|c| clean(c))
                 .unwrap_or_default();
 
             let upper = description.to_uppercase();
 
             account.rows.push(ParsedRow {
                 date,
-                // Card payments are internal: money moving from your current
-                // account to your card, already counted as spending when the
-                // purchase was made.
                 is_internal: PAYMENT_MARKERS.iter().any(|m| upper.contains(m)),
                 description,
+                // Two levels joined by a hyphen, e.g.
+                // "General Purchases-Sporting Goods Stores". Kept whole; the
+                // rules engine can split or match on either half.
                 category: cols
                     .category
                     .and_then(|i| row.get(i))
-                    .map(|c| c.trim().to_string())
+                    .map(|c| clean(c))
                     .filter(|c| !c.is_empty()),
-                reference: cols
+                // Amex prefixes references with an apostrophe so spreadsheets
+                // treat them as text.
+                external_id: cols
                     .reference
                     .and_then(|i| row.get(i))
-                    .map(|c| c.trim().to_string())
+                    .map(|c| clean(c).trim_start_matches('\'').to_string())
                     .filter(|c| !c.is_empty()),
-                amount_text,
+                reference: None,
+                // Holds "Foreign Spend Amount: ..." on FX transactions.
+                details: cols
+                    .extended
+                    .and_then(|i| row.get(i))
+                    .map(|c| clean(c))
+                    .filter(|c| !c.is_empty()),
+                amount_text: format!("{:.2}", amount_minor as f64 / 100.0),
                 amount_minor,
                 currency,
                 base_amount_minor: None,
                 base_currency: None,
-                // No running balance in an Amex export.
                 balance_minor: None,
                 fee_minor: 0,
                 is_pending: false,
@@ -141,13 +137,10 @@ impl StatementParser for AmexCsv {
     }
 }
 
-fn last_four(text: &str) -> String {
-    let digits: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
-    digits
-        .len()
-        .checked_sub(4)
-        .map(|start| digits[start..].to_string())
-        .unwrap_or(digits)
+/// Address and description fields contain embedded newlines, which survive
+/// CSV parsing intact and then wreck column alignment when printed.
+fn clean(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn find(header: &[String], name: &str) -> Option<usize> {
@@ -162,8 +155,6 @@ fn find_containing(header: &[String], needle: &str) -> Option<usize> {
         .position(|h| h.trim().to_uppercase().contains(&needle.to_uppercase()))
 }
 
-/// Amex sometimes omits the header entirely and sometimes precedes it with
-/// account preamble, so scan the first few rows.
 fn header_row(records: &[Vec<String>]) -> Option<(usize, &Vec<String>)> {
     records
         .iter()
@@ -178,7 +169,7 @@ struct Columns {
     description: Option<usize>,
     category: Option<usize>,
     reference: Option<usize>,
-    card: Option<usize>,
+    extended: Option<usize>,
 }
 
 impl Columns {
@@ -186,13 +177,14 @@ impl Columns {
         Some(Columns {
             date: find(header, "Date")?,
             amount: find(header, "Amount")?,
+            // "Appears On Your Statement As" is often cleaner than
+            // "Description", but Description is the one that is always
+            // present, so it stays primary.
             description: find(header, "Description")
-                .or_else(|| find_containing(header, "Merchant")),
+                .or_else(|| find_containing(header, "Appears On Your Statement")),
             category: find(header, "Category"),
             reference: find(header, "Reference"),
-            card: find(header, "Card Member")
-                .or_else(|| find_containing(header, "Account #"))
-                .or_else(|| find_containing(header, "Card Number")),
+            extended: find(header, "Extended Details"),
         })
     }
 }

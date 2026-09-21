@@ -1,18 +1,25 @@
 //! Lloyds internet banking CSV export.
 //!
-//! UNVERIFIED against a real file. Written from the documented column set:
+//! Verified against a real export:
 //!
 //!   Transaction Date, Transaction Type, Sort Code, Account Number,
 //!   Transaction Description, Debit Amount, Credit Amount, Balance
 //!
-//! Columns are matched by name rather than position, so extra or reordered
-//! columns are tolerated; only a rename breaks it. Run `inspect` on a real
-//! export and correct the header names below if detection fails.
-//!
-//! Export limits worth remembering: desktop internet banking only, roughly
-//! 150 transactions per download, 90 days per request, about 12 months of
-//! history. Long periods must be exported in several files — which is exactly
-//! why the balance chain check matters here.
+//! Notes from the real file:
+//!   * Rows are NEWEST-FIRST. Normalised centrally by `ensure_chronological`.
+//!   * Sort Code is prefixed with an apostrophe ('30-99-62) as a spreadsheet
+//!     text guard, and hyphenated. Digits are extracted for the account key.
+//!   * Debit and Credit are separate columns, both positive.
+//!   * Transaction Type is a code, not a merchant category:
+//!       DEB  card payment          FPO  faster payment out
+//!       FPI  faster payment in     SO   standing order
+//!       DD   direct debit          BGC  bank giro credit (salary, cashback)
+//!       TFR  transfer              CSH  cash / ATM
+//!     Useful as a signal — SO and TFR are rarely discretionary spending —
+//!     but not a substitute for categorisation.
+//!   * A single export covered 717 transactions over 12 months, so the
+//!     150-row cap that gets quoted for Lloyds exports did not apply here.
+//!     Still worth checking the balance chain on every import.
 
 use anyhow::Result;
 
@@ -129,6 +136,8 @@ impl StatementParser for LloydsCsv {
                 // first-pass signal — TFR and SO are rarely discretionary.
                 category: transaction_type,
                 reference: None,
+                external_id: None,
+                details: None,
                 amount_text,
                 amount_minor,
                 currency: "GBP".into(),

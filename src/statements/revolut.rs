@@ -112,6 +112,8 @@ impl StatementParser for RevolutCsv {
                     .is_some_and(|c| INTERNAL_CATEGORIES.contains(&c)),
                 category,
                 reference: None,
+                external_id: None,
+                details: None,
                 amount_text,
                 amount_minor,
                 currency: row_currency,
