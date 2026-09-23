@@ -1,0 +1,11 @@
+[package]
+name = "argus-analytics"
+edition.workspace = true
+version.workspace = true
+
+# Reads tables, never writes them. No reqwest, no csv — that is the point.
+[dependencies]
+argus-core = { path = "../core" }
+anyhow.workspace = true
+chrono.workspace = true
+sqlx.workspace = true

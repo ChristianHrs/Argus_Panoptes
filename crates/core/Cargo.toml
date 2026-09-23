@@ -1,0 +1,9 @@
+[package]
+name = "argus-core"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+sqlx.workspace = true

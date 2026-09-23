@@ -1,7 +1,6 @@
-mod categorise;
-mod db;
-mod importer;
-mod statements;
+use argus_analytics::spending;
+use argus_banking::{categorise, importer, statements};
+use argus_core::db;
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -22,6 +21,12 @@ async fn main() -> Result<()> {
     let raw: Vec<String> = env::args().skip(1).collect();
     let dry_run = raw.iter().any(|a| a == "--dry-run");
     let reset = raw.iter().any(|a| a == "--reset");
+
+    // --months N, --out <path>
+    let months: i64 = flag_value(&raw, "--months")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
+    let out_path = flag_value(&raw, "--out");
     let args: Vec<String> = raw.into_iter().filter(|a| !a.starts_with("--")).collect();
 
     match args.first().map(String::as_str) {
@@ -51,6 +56,20 @@ async fn main() -> Result<()> {
             categorise::assign_manual(&pool, id, category).await
         }
 
+        Some("report") => {
+            let text = spending::build(&pool, months).await?;
+
+            match out_path {
+                Some(path) => {
+                    std::fs::write(&path, &text)?;
+                    println!("Wrote {path}");
+                }
+                None => print!("{text}"),
+            }
+
+            Ok(())
+        }
+
         Some("accounts") => accounts(&pool).await,
         Some("batches") => batches(&pool).await,
 
@@ -64,6 +83,9 @@ async fn main() -> Result<()> {
                  --reset           re-apply from scratch, keeping manual tags\n    \
                  --dry-run         show what would be assigned\n  \
                  tag <id> <cat>      set a category by hand\n  \
+                 report              spending breakdown\n    \
+                 --months N        window for category and merchant sections (default 12)\n    \
+                 --out <file>      write to a file instead of stdout\n  \
                  accounts            stored accounts and coverage\n  \
                  batches             import history"
             );
@@ -304,6 +326,15 @@ async fn batches(pool: &SqlitePool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Reads `--flag value` out of the raw argument list.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .filter(|v| !v.starts_with("--"))
+        .cloned()
 }
 
 /// create_if_missing creates the database file, not the directory holding it.

@@ -1,0 +1,20 @@
+[package]
+name = "argus-cli"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "argus"
+path = "src/main.rs"
+
+[dependencies]
+argus-core      = { path = "../core" }
+argus-banking   = { path = "../banking" }
+argus-investing = { path = "../investing" }
+argus-health    = { path = "../health" }
+argus-analytics = { path = "../analytics" }
+anyhow.workspace = true
+chrono.workspace = true
+dotenvy.workspace = true
+sqlx.workspace = true
+tokio.workspace = true

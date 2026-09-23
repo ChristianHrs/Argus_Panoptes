@@ -1,0 +1,2 @@
+[alias]
+argus = "run -p argus-cli --"

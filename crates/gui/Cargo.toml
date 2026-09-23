@@ -1,0 +1,20 @@
+[package]
+name = "argus-gui"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "argus-gui"
+path = "src/main.rs"
+
+# Only this crate pulls eframe, so a CLI build never compiles it.
+[dependencies]
+argus-core      = { path = "../core" }
+argus-analytics = { path = "../analytics" }
+anyhow.workspace = true
+chrono.workspace = true
+dotenvy.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+eframe = "0.29"
+egui_plot = "0.29"

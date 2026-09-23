@@ -1,0 +1,13 @@
+[package]
+name = "argus-health"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+argus-core = { path = "../core" }
+anyhow.workspace = true
+chrono.workspace = true
+csv.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
