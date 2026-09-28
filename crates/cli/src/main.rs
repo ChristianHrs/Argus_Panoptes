@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let database_url =
-        env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://spending.db".to_string());
+        env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data/spending.db".to_string());
 
     ensure_parent_dir(&database_url)?;
     let pool = db::connect(&database_url).await?;

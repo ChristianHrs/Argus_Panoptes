@@ -55,6 +55,7 @@ pub async fn build(pool: &SqlitePool, months: i64) -> Result<String> {
     overview(pool, &mut out).await?;
     monthly(pool, &mut out, months).await?;
     categories(pool, &mut out, months).await?;
+    day_of_week(pool, &mut out).await?;
     merchants(pool, &mut out, months).await?;
     recurring(pool, &mut out).await?;
     gaps(pool, &mut out).await?;
@@ -281,6 +282,140 @@ async fn categories(pool: &SqlitePool, out: &mut String, months: i64) -> Result<
     }
 
     writeln!(out, "\n  {:<18} {}\n", "TOTAL", money(grand))?;
+    Ok(())
+}
+
+
+// ---------------------------------------------------------------------------
+
+/// Spend by weekday, with each day's own category split underneath.
+///
+/// Reads v_day_of_week and v_day_of_week_category, which count days with no
+/// spending as zero. Averaging only the days money moved would answer "when
+/// I spend, how much" — a different question, and one that makes a quiet
+/// week look identical to a busy one.
+async fn day_of_week(pool: &SqlitePool, out: &mut String) -> Result<()> {
+    let days = sqlx::query(
+        r#"
+        SELECT dow_order, day_name, days_observed, days_with_spending,
+               transactions, total_gbp, avg_per_day_gbp, median_per_day_gbp,
+               busiest_day_gbp, median_txn_gbp
+          FROM v_day_of_week
+         ORDER BY dow_order
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if days.is_empty() {
+        return Ok(());
+    }
+
+    let categories = sqlx::query(
+        r#"
+        SELECT dow_order, category, n, total_gbp
+          FROM v_day_of_week_category
+         ORDER BY dow_order, total_gbp DESC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    writeln!(out, "═══ BY DAY OF WEEK ═══\n")?;
+    writeln!(
+        out,
+        "  day        days  spent     avg/day  median  med/txn"
+    )?;
+
+    // Scale the bars on the median, not the mean. One rent payment landing on
+    // a Tuesday makes that day's mean several times its median and every
+    // other bar unreadable by comparison.
+    let max_median = days
+        .iter()
+        .filter_map(|r| r.get::<Option<f64>, _>("median_per_day_gbp"))
+        .fold(0.0_f64, f64::max);
+
+    for day in &days {
+        let dow: i64 = day.get("dow_order");
+        let median = day.get::<Option<f64>, _>("median_per_day_gbp").unwrap_or(0.0);
+        let avg: f64 = day.get::<Option<f64>, _>("avg_per_day_gbp").unwrap_or(0.0);
+
+        writeln!(
+            out,
+            "  {:<10} {:>3}  {:>9.2} {:>8.2} {:>7.2} {:>8.2}  {}",
+            day.get::<String, _>("day_name"),
+            day.get::<i64, _>("days_with_spending"),
+            day.get::<Option<f64>, _>("total_gbp").unwrap_or(0.0),
+            avg,
+            median,
+            day.get::<Option<f64>, _>("median_txn_gbp").unwrap_or(0.0),
+            bar(median, max_median, 16),
+        )?;
+
+        // A mean far above the median means one or two large payments land on
+        // this weekday — usually rent or a card bill, not a habit.
+        if median > 0.0 && avg > median * 2.0 {
+            writeln!(
+                out,
+                "  {:<10} mean is {:.1}x the median — a few large payments land here",
+                "",
+                avg / median
+            )?;
+        }
+
+        let top: Vec<_> = categories
+            .iter()
+            .filter(|c| c.get::<i64, _>("dow_order") == dow)
+            .take(4)
+            .collect();
+
+        let day_total: f64 = categories
+            .iter()
+            .filter(|c| c.get::<i64, _>("dow_order") == dow)
+            .map(|c| c.get::<Option<f64>, _>("total_gbp").unwrap_or(0.0))
+            .sum();
+
+        for category in top {
+            let total = category.get::<Option<f64>, _>("total_gbp").unwrap_or(0.0);
+
+            writeln!(
+                out,
+                "    └ {:<18} {:>9.2}  {:>5.1}%  ({}x)",
+                truncate(&category.get::<String, _>("category"), 18),
+                total,
+                if day_total > 0.0 { total / day_total * 100.0 } else { 0.0 },
+                category.get::<i64, _>("n"),
+            )?;
+        }
+
+        writeln!(out)?;
+    }
+
+    // Weekday against weekend, on medians so a monthly bill does not decide
+    // the answer.
+    let weekday: Vec<f64> = days
+        .iter()
+        .filter(|d| d.get::<i64, _>("dow_order") <= 5)
+        .filter_map(|d| d.get::<Option<f64>, _>("median_per_day_gbp"))
+        .collect();
+
+    let weekend: Vec<f64> = days
+        .iter()
+        .filter(|d| d.get::<i64, _>("dow_order") >= 6)
+        .filter_map(|d| d.get::<Option<f64>, _>("median_per_day_gbp"))
+        .collect();
+
+    if !weekday.is_empty() && !weekend.is_empty() {
+        let wd = weekday.iter().sum::<f64>() / weekday.len() as f64;
+        let we = weekend.iter().sum::<f64>() / weekend.len() as f64;
+
+        writeln!(
+            out,
+            "  Typical weekday {wd:.2}   typical weekend day {we:.2}   ({:+.0}%)\n",
+            (we - wd) / wd.max(0.01) * 100.0
+        )?;
+    }
+
     Ok(())
 }
 

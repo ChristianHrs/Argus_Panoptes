@@ -111,6 +111,11 @@ cargo argus accounts                    # accounts and date coverage
 cargo argus batches                     # import history
 ```
 
+If there is a build problem after adding a sql file, run:
+```bash
+cargo build -p argus-cli
+```
+
 ### First run
 
 ```bash
