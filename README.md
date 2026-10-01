@@ -19,6 +19,11 @@ access behind business onboarding. Downloaded statements it is.
 
 ```ini
 DATABASE_URL=sqlite://data/spending.db
+LIVE_TRADING212_API_KEY=your_api_key
+LIVE_TRADING212_SECRET=your_api_secret
+# Optional demo account:
+DEMO_TRADING212_API_KEY=your_demo_api_key
+DEMO_TRADING212_SECRET=your_demo_api_secret
 ```
 
 `.gitignore`:
@@ -109,6 +114,36 @@ cargo argus report                      # spending breakdown
 cargo argus report --months 6 --out breakdown.txt
 cargo argus accounts                    # accounts and date coverage
 cargo argus batches                     # import history
+cargo argus invest-sync                 # fetch live Trading 212 data
+cargo argus invest-sync --demo          # fetch demo Trading 212 data
+cargo argus invest-report               # exposure and dividend analysis
+cargo argus invest-report --out investments.txt
+```
+
+## Trading 212
+
+`invest-sync` stores a timestamped portfolio snapshot and upserts the complete
+paginated dividend history. Re-running it does not duplicate dividends. The
+report shows portfolio contributors by company, sector and country; monthly
+and weekly dividend payment counts and totals; and dividend contributors.
+
+Trading 212 does not reliably include sector metadata. Country initially
+falls back to the two-letter ISIN issuer/domicile prefix. Set accurate local
+classifications where needed; later syncs preserve them:
+
+```bash
+cargo argus invest-classify AAPL_US_EQ "Technology" "United States"
+```
+
+Over/under exposure requires your intended allocation rather than an invented
+benchmark. Add sector or country targets, then rerun the report. The displayed
+delta is actual allocation minus target, so positive is over target and
+negative is under target.
+
+```bash
+cargo argus invest-target sector "Technology" 25
+cargo argus invest-target country "United States" 50
+cargo argus invest-report
 ```
 
 If there is a build problem after adding a sql file, run:

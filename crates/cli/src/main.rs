@@ -1,6 +1,7 @@
-use argus_analytics::spending;
+use argus_analytics::{investing, spending};
 use argus_banking::{categorise, importer, statements};
 use argus_core::db;
+use argus_investing::{client::Trading212Client, import as investing_import};
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,7 @@ async fn main() -> Result<()> {
     let raw: Vec<String> = env::args().skip(1).collect();
     let dry_run = raw.iter().any(|a| a == "--dry-run");
     let reset = raw.iter().any(|a| a == "--reset");
+    let demo = raw.iter().any(|a| a == "--demo");
 
     // --months N, --out <path>
     let months: i64 = flag_value(&raw, "--months")
@@ -70,6 +72,50 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
+        Some("invest-sync") => invest_sync(&pool, demo).await,
+
+        Some("invest-report") => {
+            let text = investing::build(&pool).await?;
+
+            match out_path {
+                Some(path) => {
+                    std::fs::write(&path, &text)?;
+                    println!("Wrote {path}");
+                }
+                None => print!("{text}"),
+            }
+
+            Ok(())
+        }
+
+        Some("invest-target") => {
+            let dimension = args
+                .get(1)
+                .context("usage: invest-target <sector|country> <label> <percent>")?;
+            let label = args
+                .get(2)
+                .context("usage: invest-target <sector|country> <label> <percent>")?;
+            let percent: f64 = args
+                .get(3)
+                .context("usage: invest-target <sector|country> <label> <percent>")?
+                .parse()
+                .context("target percent must be a number")?;
+            set_investment_target(&pool, dimension, label, percent).await
+        }
+
+        Some("invest-classify") => {
+            let ticker = args
+                .get(1)
+                .context("usage: invest-classify <ticker> <sector> <country>")?;
+            let sector = args
+                .get(2)
+                .context("usage: invest-classify <ticker> <sector> <country>")?;
+            let country = args
+                .get(3)
+                .context("usage: invest-classify <ticker> <sector> <country>")?;
+            classify_instrument(&pool, ticker, sector, country).await
+        }
+
         Some("accounts") => accounts(&pool).await,
         Some("batches") => batches(&pool).await,
 
@@ -86,12 +132,86 @@ async fn main() -> Result<()> {
                  report              spending breakdown\n    \
                  --months N        window for category and merchant sections (default 12)\n    \
                  --out <file>      write to a file instead of stdout\n  \
+                 invest-sync         fetch Trading 212 holdings and dividends\n    \
+                 --demo            use the Trading 212 demo account\n  \
+                 invest-report       portfolio, exposure and dividend breakdowns\n  \
+                 invest-target <sector|country> <label> <percent>\n  \
+                 invest-classify <ticker> <sector> <country>\n  \
                  accounts            stored accounts and coverage\n  \
                  batches             import history"
             );
             Ok(())
         }
     }
+}
+
+async fn invest_sync(pool: &SqlitePool, demo: bool) -> Result<()> {
+    let prefix = if demo { "DEMO" } else { "LIVE" };
+    let api_key = env::var(format!("{prefix}_TRADING212_API_KEY"))
+        .with_context(|| format!("{prefix}_TRADING212_API_KEY is not set"))?;
+    let api_secret = env::var(format!("{prefix}_TRADING212_SECRET"))
+        .with_context(|| format!("{prefix}_TRADING212_SECRET is not set"))?;
+    let client = Trading212Client::new(api_key, api_secret, demo)?;
+    let report = investing_import::sync(pool, &client).await?;
+
+    println!(
+        "Trading 212 snapshot {}: {} positions, {} dividends stored.",
+        report.captured_at, report.positions, report.dividends_seen
+    );
+    Ok(())
+}
+
+async fn set_investment_target(
+    pool: &SqlitePool,
+    dimension: &str,
+    label: &str,
+    percent: f64,
+) -> Result<()> {
+    if !matches!(dimension, "sector" | "country") {
+        anyhow::bail!("dimension must be sector or country");
+    }
+    if !(0.0..=100.0).contains(&percent) {
+        anyhow::bail!("target percent must be between 0 and 100");
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO investment_exposure_targets (dimension, label, target_pct)
+        VALUES (?, ?, ?)
+        ON CONFLICT(dimension, label) DO UPDATE SET target_pct = excluded.target_pct
+        "#,
+    )
+    .bind(dimension)
+    .bind(label)
+    .bind(percent)
+    .execute(pool)
+    .await?;
+
+    println!("Set {dimension} target {label} to {percent:.2}%.");
+    Ok(())
+}
+
+async fn classify_instrument(
+    pool: &SqlitePool,
+    ticker: &str,
+    sector: &str,
+    country: &str,
+) -> Result<()> {
+    let result = sqlx::query(
+        "UPDATE investment_instruments SET sector = ?, country = ? WHERE ticker = ?",
+    )
+    .bind(sector)
+    .bind(country)
+    .bind(ticker)
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        anyhow::bail!("unknown ticker {ticker}; run invest-sync first");
+    }
+
+    println!("Classified {ticker} as {sector}, {country}.");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
